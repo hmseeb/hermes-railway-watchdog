@@ -4,8 +4,9 @@ Wires configuration, the Railway and Hermes clients, the recovery orchestrator, 
 notifications into a single run. Production dependencies are built from the environment;
 tests inject a :class:`Runtime` to stay fully network-free.
 
-Only public-safe text is ever emitted: opaque aliases, broad classifications, action
-names, elapsed time, and pass/fail — all passed through the central redactor.
+Only public-safe text is ever emitted: operator-chosen service names (intentionally
+public), broad classifications, action names, elapsed time, and pass/fail — all passed
+through the central redactor, which still masks every genuinely-secret field.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from datetime import UTC, datetime
 from .config import Target, WatchdogConfig, load_config
 from .errors import ConfigError, WatchdogError
 from .hermes import HermesClient
+from .markdown import sanitize_markdown_inline
 from .notify import Notifier, build_notifier_from_env
 from .orchestrator import Orchestrator, RunResult
 from .railway import RailwayClient
@@ -95,8 +97,15 @@ def render_summary(result: RunResult, redactor: Redactor, *, dry_run: bool) -> s
     for o in result.outcomes:
         verdict = "PASS" if (o.recovered or o.deferred) else "FAIL"
         cls = o.classification.value if o.classification else "unknown"
+        # service_name is operator-chosen free text. Redact it FIRST — while any secret
+        # it embeds (health URL/host, email-like username, id, token) is still
+        # contiguous — THEN neutralize Markdown/HTML structure. Sanitizing first would
+        # escape URL/email joiners (\. \: \/ \@ \_) and defeat the redactor's exact and
+        # pattern matches. The final whole-summary redaction below stays as defense in
+        # depth; the resulting [REDACTED] mask is itself Markdown-escaped here.
+        name = sanitize_markdown_inline(redactor.redact(o.service_name))
         lines.append(
-            f"- {o.alias}: {cls} | action={o.action} | "
+            f"- {name}: {cls} | action={o.action} | "
             f"elapsed={o.elapsed_seconds:.2f}s | {verdict}"
         )
     unrecovered = result.unrecovered()

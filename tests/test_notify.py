@@ -19,12 +19,18 @@ from watchdog.orchestrator import RunResult, TargetOutcome
 from watchdog.redaction import Redactor
 from watchdog.state import Classification
 
-REDACTOR = Redactor(secrets=["internal-name-a", "https://real-host.example.test/health"])
+# Service names are intentionally public, so they are NOT in the redactor's secret
+# set — only genuinely-secret material (hosts, credentials) is.
+REDACTOR = Redactor(secrets=["https://real-host.example.test/health", "p@ss-secret"])
 
 
-def _outcome(alias="svc-a", *, cls, action="none", recovered, deferred=False, error=None):
+def _outcome(
+    alias="svc-a", *, cls, service_name="payments-api", action="none",
+    recovered, deferred=False, error=None,
+):
     return TargetOutcome(
         alias=alias,
+        service_name=service_name,
         classification=cls,
         action=action,
         recovered=recovered,
@@ -78,15 +84,20 @@ def _client(handler) -> AgentMailClient:
 
 # --- email content ------------------------------------------------------------
 
-def test_build_email_is_public_safe():
+def test_build_email_shows_service_name_and_hides_other_secrets():
     o = _outcome(cls=Classification.CONTAINER_FAILURE, action="container_restart",
-                 recovered=False, error="boom https://real-host.example.test/health leaked")
+                 service_name="payments-api", recovered=False,
+                 error="boom https://real-host.example.test/health leaked")
     subject, html, text = build_email(o, "incident", REDACTOR)
     for blob in (subject, html, text):
+        # Every genuinely-secret field stays redacted.
         assert "real-host.example.test" not in blob
-        assert "internal-name-a" not in blob
-    # Allowed public content is present.
-    assert "svc-a" in subject
+        # The opaque alias is no longer the user-facing identity.
+        assert "svc-a" not in blob
+    # The real, operator-chosen service name is now the public identity.
+    assert "payments-api" in subject
+    assert "payments-api" in html
+    assert "payments-api" in text
     assert "container_failure" in html
     assert "container_restart" in text
 
@@ -259,8 +270,9 @@ def test_healthy_with_no_marker_stays_silent():
 
 
 def test_build_email_escapes_html_injection():
-    # Even if a markup-shaped alias reached rendering, it must be HTML-escaped.
-    o = _outcome("svc-<script>alert(1)</script>", cls=Classification.CONTAINER_FAILURE,
+    # Even if a markup-shaped service_name reached rendering, it must be HTML-escaped.
+    o = _outcome(cls=Classification.CONTAINER_FAILURE,
+                 service_name="<script>alert(1)</script>",
                  action="container_restart", recovered=False)
     _, html, _ = build_email(o, "incident", Redactor())
     assert "<script>" not in html

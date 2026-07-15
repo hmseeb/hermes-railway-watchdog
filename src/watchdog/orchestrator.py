@@ -49,7 +49,8 @@ class HermesLike(Protocol):
 
 @dataclass(frozen=True)
 class TargetOutcome:
-    alias: str
+    alias: str  # opaque, internal — dedup key and --service selection only
+    service_name: str  # operator-chosen, public identity rendered to users
     classification: Classification | None
     action: str  # "none" | "gateway_restart" | "container_restart"
     recovered: bool
@@ -178,6 +179,7 @@ class Orchestrator:
     ) -> TargetOutcome:
         return TargetOutcome(
             alias=target.alias,
+            service_name=target.service_name,
             classification=cls,
             action=action,
             recovered=recovered,

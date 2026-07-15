@@ -225,3 +225,30 @@ def test_target_repr_hides_secrets(monkeypatch, valid_config_dict):
     text = repr(cfg.targets[0])
     assert "p@ss-w0rd-a-secret" not in text
     assert "admin-a" not in text
+
+
+# --- service names are intentionally public (not secret) ----------------------
+
+def test_service_name_is_not_a_secret_value(monkeypatch, valid_config_dict):
+    # Product/privacy decision: the real service_name is operator-chosen public
+    # identity, so it must NOT be handed to the redactor as a secret. Every other
+    # secret-bearing field of the target still is.
+    cfg = _load(monkeypatch, valid_config_dict)
+    target = cfg.targets[0]
+    secrets = target.secret_values()
+    assert target.service_name not in secrets
+    # But the genuinely-secret fields remain masked.
+    assert target.service_id in secrets
+    assert target.health_url in secrets
+    assert target.admin_username in secrets
+    assert target.admin_password in secrets
+
+
+def test_config_secret_values_exclude_all_service_names(monkeypatch, valid_config_dict):
+    cfg = _load(monkeypatch, valid_config_dict)
+    all_secrets = cfg.all_secret_values()
+    for target in cfg.targets:
+        assert target.service_name not in all_secrets
+    # Sanity: real identifiers are still present to be redacted.
+    assert cfg.project_id in all_secrets
+    assert cfg.excluded_service_id in all_secrets

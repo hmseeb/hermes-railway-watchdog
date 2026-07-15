@@ -141,6 +141,18 @@ def _one(cfg):
 
 # --- healthy ------------------------------------------------------------------
 
+def test_outcome_carries_real_service_name_and_internal_alias():
+    # The outcome must expose the operator-chosen public service_name for rendering,
+    # while retaining the opaque alias for internal dedup/selection.
+    cfg = _cfg()
+    rw = FakeRailway(RUNNING)
+    hm = FakeHermes()
+    res = _orch(cfg, rw, {"svc-a": hm}).run(_one(cfg))
+    o = res.outcomes[0]
+    assert o.alias == "svc-a"
+    assert o.service_name == "n-a"
+
+
 def test_healthy_target_is_never_mutated():
     cfg = _cfg()
     rw = FakeRailway(RUNNING)

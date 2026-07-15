@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime, timedelta
 
-from watchdog.cli import Runtime, build_parser, main
+from watchdog.cli import Runtime, build_parser, main, render_summary
 from watchdog.config import WatchdogConfig
 from watchdog.notify import Notifier
-from watchdog.orchestrator import Orchestrator
+from watchdog.orchestrator import Orchestrator, RunResult, TargetOutcome
 from watchdog.railway import DeploymentStatus, ServiceStatus
 from watchdog.redaction import Redactor
+from watchdog.state import Classification
 
 ENV = "WATCHDOG_TARGETS_JSON"
 NOW = datetime(2026, 7, 15, 12, 0, 0, tzinfo=UTC)
@@ -68,6 +70,88 @@ def _runtime_factory(railway, hermes_map, *, notifier=None):
     return factory
 
 
+# --- summary markdown-injection safety ----------------------------------------
+
+def _named_outcome(name):
+    return TargetOutcome(
+        alias="svc-a", service_name=name, classification=Classification.HEALTHY,
+        action="none", recovered=True, deferred=False, elapsed_seconds=0.5, error=None,
+    )
+
+
+def test_render_summary_flattens_injected_rows_and_headings():
+    # A malicious service_name tries to forge a second row and a heading.
+    evil = "pwned\n- ghost: healthy | action=none | elapsed=0.00s | PASS\n# FAKE HEADING"
+    summary = render_summary(RunResult((_named_outcome(evil),)), Redactor(), dry_run=False)
+    lines = summary.split("\n")
+    # Exactly one bullet row (the real one) — the injected newline cannot forge another.
+    assert sum(1 for ln in lines if ln.startswith("- ")) == 1
+    # Exactly one heading — the real title — the injected "# FAKE HEADING" is inert.
+    assert sum(1 for ln in lines if ln.startswith("# ")) == 1
+    # Human-readable text is still present, but only inline.
+    assert "pwned" in summary and "ghost" in summary
+    assert "\n- ghost" not in summary
+
+
+def test_render_summary_neutralizes_html_and_links_in_service_name():
+    evil = "<img src=x onerror=alert(1)> [x](http://evil.test)"
+    summary = render_summary(RunResult((_named_outcome(evil),)), Redactor(), dry_run=False)
+    assert "<img" not in summary and "&lt;img" in summary
+    assert "](" not in summary          # no functional link joint survives
+
+
+def test_render_summary_leaves_benign_names_readable():
+    result = RunResult((_named_outcome("orders-api-1"),))
+    summary = render_summary(result, Redactor(), dry_run=False)
+    assert "- orders-api-1: healthy" in summary   # no gratuitous escaping
+
+
+# --- summary redaction-order safety -------------------------------------------
+
+def _markdown_rendered(summary: str) -> str:
+    """Approximate GitHub's rendering: a backslash before ASCII punctuation is dropped,
+    so the literal character becomes visible to a human reader. This models what a
+    reader actually sees, catching secrets that only "hide" behind escape backslashes.
+    """
+    return re.sub(r"\\([!-/:-@\[-`{-~])", r"\1", summary)
+
+
+def test_render_summary_redacts_secrets_embedded_in_service_name():
+    # A public service_name that embeds secret material (health URL/host, email-like
+    # admin username, UUID service id, token) must have those parts redacted even
+    # though the sanitizer escapes URL/email joiners. Redaction must therefore run on
+    # the raw name BEFORE Markdown escaping, or the secret survives as readable text.
+    secret_url = "https://gw.internal.example/health"
+    secret_user = "ops@corp.example"            # email-like admin username
+    secret_uuid = "3a7c1e2b-9f4d-4a6b-8c1d-2e3f4a5b6c7d"
+    secret_tok = "tok_0123456789abcdef0123"     # token-shaped (fabricated)
+    r = Redactor(secrets=[secret_url, secret_user, secret_uuid, secret_tok])
+    name = f"gw {secret_url} {secret_user} {secret_uuid} {secret_tok}"
+
+    summary = render_summary(RunResult((_named_outcome(name),)), r, dry_run=True)
+    rendered = _markdown_rendered(summary)
+
+    for leaked in (secret_url, secret_user, secret_uuid, secret_tok,
+                   "gw.internal.example", "://", "@corp.example"):
+        assert leaked not in summary    # not in the raw Markdown
+        assert leaked not in rendered   # nor as GitHub would render it
+    # The mask is present and Markdown-safe: its brackets are escaped so it renders as
+    # literal text (never a shortcut-reference link) yet still reads as [REDACTED].
+    assert "\\[REDACTED\\]" in summary
+    assert "[REDACTED]" in rendered
+    # The ordinary, non-secret part of the name stays readable.
+    assert "gw" in rendered
+
+
+def test_render_summary_ordinary_name_survives_active_redactor():
+    # With a redactor carrying unrelated secrets, an ordinary name must not be mangled
+    # or spuriously redacted.
+    r = Redactor(secrets=["https://gw.internal.example/health", "ops@corp.example"])
+    summary = render_summary(RunResult((_named_outcome("orders-api-1"),)), r, dry_run=True)
+    assert "- orders-api-1: healthy" in summary
+    assert "[REDACTED]" not in summary
+
+
 # --- arg parsing --------------------------------------------------------------
 
 def test_parser_defaults():
@@ -89,7 +173,22 @@ def test_dry_run_healthy_all_exit_zero(monkeypatch, capsys, valid_config_json, v
     code = main(["--dry-run"], runtime_factory=factory)
     out = capsys.readouterr().out
     assert code == 0
-    assert "svc-a" in out and "healthy" in out
+    # The real service name is the public identity now — the opaque alias is internal.
+    assert "internal-name-a" in out and "healthy" in out
+
+
+def test_summary_shows_real_service_names_not_aliases(
+    monkeypatch, capsys, valid_config_json, valid_config_dict
+):
+    monkeypatch.setenv(ENV, valid_config_json)
+    hermes_map = {t["alias"]: FakeHermes() for t in valid_config_dict["targets"]}
+    factory = _runtime_factory(FakeRailway(_running()), hermes_map)
+    code = main(["--dry-run"], runtime_factory=factory)
+    out = capsys.readouterr().out
+    assert code == 0
+    for t in valid_config_dict["targets"]:
+        assert t["service_name"] in out   # real name is rendered
+        assert t["alias"] not in out       # opaque alias is not user-facing
 
 
 def test_output_never_leaks_secrets(monkeypatch, capsys, valid_config_json, valid_config_dict):
@@ -100,9 +199,11 @@ def test_output_never_leaks_secrets(monkeypatch, capsys, valid_config_json, vali
     out = capsys.readouterr().out
     assert code == 0
     for t in valid_config_dict["targets"]:
-        assert t["service_name"] not in out
+        # Service names are intentionally public; everything else stays secret.
+        assert t["service_name"] in out
         assert t["admin_password"] not in out
         assert t["health_url"] not in out
+        assert t["service_id"] not in out
     assert "example.test" not in out
 
 
@@ -124,7 +225,7 @@ def test_writes_github_step_summary(tmp_path, monkeypatch, valid_config_json, va
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
     hermes_map = {t["alias"]: FakeHermes() for t in valid_config_dict["targets"]}
     main(["--dry-run"], runtime_factory=_runtime_factory(FakeRailway(_running()), hermes_map))
-    assert "svc-a" in summary.read_text()
+    assert "internal-name-a" in summary.read_text()
 
 
 # --- selection & errors -------------------------------------------------------
@@ -136,8 +237,9 @@ def test_single_service_selection(monkeypatch, capsys, valid_config_json, valid_
                 runtime_factory=_runtime_factory(FakeRailway(_running()), hermes_map))
     out = capsys.readouterr().out
     assert code == 0
-    assert "svc-c" in out
-    assert "svc-a" not in out
+    assert "internal-name-c" in out   # selected target's real name
+    assert "internal-name-a" not in out
+    assert "svc-c" not in out          # opaque alias is not user-facing
 
 
 def test_unknown_service_exits_two(monkeypatch, capsys, valid_config_json):
