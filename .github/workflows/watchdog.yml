@@ -1,0 +1,55 @@
+name: watchdog
+
+# Scheduled monitor. Runs only on the default branch (schedule always does; the
+# manual dispatch is guarded below). Read-only permissions. Production secrets are
+# injected ONLY into the watchdog step's env — never at workflow or job scope. No
+# caches, artifacts, or debug tooling.
+on:
+  schedule:
+    # Every 5 minutes at a non-zero offset (minutes 2,7,12,...) to avoid the
+    # top-of-hour scheduling congestion that hits minute 0.
+    - cron: "2-59/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: watchdog-run
+  # Never cancel an in-flight run: a mid-recovery cancellation could leave a
+  # service half-restarted. Overlap is instead avoided by the app-level
+  # fresh-state recheck before every mutation.
+  cancel-in-progress: false
+
+jobs:
+  watchdog:
+    name: Run watchdog
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Guard manual dispatch to the default branch only.
+    if: github.ref == 'refs/heads/main'
+    steps:
+      # actions/checkout v4.2.2 — SHA independently verified.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          # The watchdog does no git operations; do not persist credentials.
+          persist-credentials: false
+
+      # actions/setup-python v5.3.0 — SHA independently verified.
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Run watchdog
+        # Production secrets are scoped to THIS step only.
+        env:
+          RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+          WATCHDOG_TARGETS_JSON: ${{ secrets.WATCHDOG_TARGETS_JSON }}
+          AGENTMAIL_API_KEY: ${{ secrets.AGENTMAIL_API_KEY }}
+          WATCHDOG_ALERT_TO: ${{ secrets.WATCHDOG_ALERT_TO }}
+        run: watchdog

@@ -1,0 +1,59 @@
+name: test
+
+# CI for pull requests and pushes. Uses NO production secrets and only read-only
+# permissions. Third-party actions are pinned to full commit SHAs.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  # Supersede in-progress CI for the same ref; safe because CI performs no mutations.
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Lint, type-check and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # actions/checkout v4.2.2 — SHA independently verified.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          # No git write access is needed; do not leave credentials in .git/config.
+          persist-credentials: false
+
+      # actions/setup-python v5.3.0 — SHA independently verified.
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Typecheck (mypy)
+        run: mypy
+
+      - name: Test (pytest + coverage)
+        run: pytest --cov=watchdog --cov-report=term-missing
+
+      - name: Security — secret scan
+        # Fail if anything token/secret-shaped was committed. Belt-and-braces on
+        # top of .gitignore; no external action required. The pattern is generic so
+        # this workflow itself references no production variable by name.
+        run: |
+          if git grep -nIE \
+            '(_API_(TOKEN|KEY)|_SECRET)[[:space:]]*[:=][[:space:]]*[A-Za-z0-9_-]{12,}' \
+            -- . ':(exclude).github/workflows/*' ':(exclude)tests/*'; then
+            echo "Potential committed secret found"; exit 1
+          fi
+          echo "secret scan clean"

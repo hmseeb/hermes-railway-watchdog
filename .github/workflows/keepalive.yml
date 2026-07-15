@@ -1,0 +1,57 @@
+name: keepalive
+
+# Monthly heartbeat to keep scheduled workflows from being disabled after 60 days
+# of repository inactivity. Uses NO production secrets and NO checkout — it updates a
+# single tracked file (.github/keepalive) via the REST contents API, so no repository
+# credentials are ever persisted to disk.
+#
+# RESIDUAL 60-DAY RISK — READ BEFORE RELYING ON THIS:
+# GitHub disables scheduled workflows on public repos after 60 days of no
+# "repository activity". It is NOT guaranteed that a commit made with the default
+# GITHUB_TOKEN counts as qualifying activity for re-arming that timer; GitHub's
+# documentation historically distinguishes automated GITHUB_TOKEN activity from
+# user activity. This workflow therefore CANNOT promise the schedule stays armed.
+# Verify against current GitHub behavior; if uncertain, have a human make an
+# occasional commit or run the schedule via workflow_dispatch. Do not treat this
+# as a guarantee.
+on:
+  schedule:
+    # 07:11 on the 1st of every month (day-of-month pinned → monthly).
+    - cron: "11 7 1 * *"
+  workflow_dispatch:
+
+# No permissions at the workflow level; the single job below requests the minimum.
+permissions: {}
+
+concurrency:
+  group: keepalive
+  # Do not cancel an in-flight heartbeat commit.
+  cancel-in-progress: false
+
+jobs:
+  heartbeat:
+    name: Update keepalive heartbeat
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      # Strictly required and used directly: the only action of this job is to commit an
+      # updated timestamp to the single tracked file .github/keepalive via the REST
+      # contents API. No other scope is requested anywhere in this workflow.
+      contents: write # required: PUT timestamp to .github/keepalive via REST contents API
+    steps:
+      - name: Update keepalive heartbeat
+        # Token is scoped to this step only; nothing is logged (no shell tracing, the
+        # PUT is --silent, and the SHA is captured into a variable and never echoed).
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          path=".github/keepalive"
+          sha="$(gh api "repos/${GITHUB_REPOSITORY}/contents/${path}?ref=${GITHUB_REF_NAME}" --jq '.sha')"
+          content="$(date -u +%Y-%m-%dT%H:%M:%SZ | base64 | tr -d '\n')"
+          gh api --silent -X PUT "repos/${GITHUB_REPOSITORY}/contents/${path}" \
+            -f message="chore: keepalive heartbeat" \
+            -f content="${content}" \
+            -f sha="${sha}" \
+            -f branch="${GITHUB_REF_NAME}"
