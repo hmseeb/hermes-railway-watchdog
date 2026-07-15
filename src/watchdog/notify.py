@@ -7,8 +7,10 @@ details are never exposed. If notification credentials are absent, the notifier 
 a degraded state (to be surfaced as a sanitized workflow failure) rather than breaking
 the recovery flow.
 
-All email content is public-safe: only opaque aliases, broad classifications, action
-names, elapsed time, and pass/fail — every field passes through the central redactor.
+All email content is public-safe: the operator-chosen service name (intentionally
+public), broad classifications, action names, elapsed time, and pass/fail — every field
+passes through the central redactor, which still masks all other production detail.
+Incident deduplication keys stay opaque (a hash of the internal alias).
 """
 
 from __future__ import annotations
@@ -47,7 +49,10 @@ def incident_key(alias: str) -> str:
 
 
 def build_email(outcome: TargetOutcome, kind: str, redactor: Redactor) -> tuple[str, str, str]:
-    alias = redactor.redact(outcome.alias)
+    # The public identity is the operator-chosen service_name (intentionally not a
+    # secret). It still passes through the redactor as defence-in-depth against any
+    # secret-shaped value and is HTML-escaped below against markup injection.
+    service = redactor.redact(outcome.service_name)
     classification = outcome.classification.value if outcome.classification else "unknown"
     action = outcome.action
     elapsed = f"{outcome.elapsed_seconds:.2f}s"
@@ -55,10 +60,10 @@ def build_email(outcome: TargetOutcome, kind: str, redactor: Redactor) -> tuple[
     headline = "Recovery succeeded" if kind == "recovery" else "Unrecoverable failure"
     accent = "#3fb950" if kind == "recovery" else "#f85149"
 
-    subject = f"[watchdog] {headline} — {alias} ({classification})"
+    subject = f"[watchdog] {headline} — {service} ({classification})"
 
     rows = {
-        "Service": alias,
+        "Service": service,
         "Classification": classification,
         "Action": action,
         "Elapsed": elapsed,
@@ -80,12 +85,13 @@ def build_email(outcome: TargetOutcome, kind: str, redactor: Redactor) -> tuple[
         f'font-size:16px;font-weight:700">{headline_html}</div>'
         f'<table style="width:100%;border-collapse:collapse;font-size:14px">{row_html}</table>'
         '<div style="padding:12px 20px;color:#6e7681;font-size:12px">'
-        "Railway + Hermes watchdog — public-safe alert (opaque identifiers only).</div>"
+        "Railway + Hermes watchdog — public-safe alert "
+        "(service name is public by operator choice; all other detail redacted).</div>"
         "</div></body></html>"
     )
     text = (
         f"{headline}\n"
-        f"Service: {alias}\n"
+        f"Service: {service}\n"
         f"Classification: {classification}\n"
         f"Action: {action}\n"
         f"Elapsed: {elapsed}\n"

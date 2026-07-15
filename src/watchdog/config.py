@@ -42,19 +42,27 @@ _TARGET_FIELDS = (
 
 @dataclass(frozen=True)
 class Target:
-    """One watched service. Secret-bearing fields are kept out of ``repr``."""
+    """One watched service.
+
+    ``service_name`` is the operator-chosen, intentionally-public identity used in all
+    user-facing output; it is deliberately *not* a secret. Every remaining
+    secret-bearing field (ids, url, credentials) is kept out of ``repr`` and masked by
+    the redactor.
+    """
 
     alias: str
-    service_name: str = field(repr=False)
+    service_name: str
     service_id: str = field(repr=False)
     health_url: str = field(repr=False)
     admin_username: str = field(repr=False)
     admin_password: str = field(repr=False)
 
     def secret_values(self) -> tuple[str, ...]:
-        """Values the redactor must mask for this target."""
+        """Values the redactor must mask for this target.
+
+        ``service_name`` is intentionally excluded: it is public by operator choice.
+        """
         return (
-            self.service_name,
             self.service_id,
             self.health_url,
             self.admin_username,
