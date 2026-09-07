@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 from watchdog.cli import Runtime, build_parser, main, render_summary
@@ -77,6 +78,13 @@ def _named_outcome(name):
         alias="svc-a", service_name=name, classification=Classification.HEALTHY,
         action="none", recovered=True, deferred=False, elapsed_seconds=0.5, error=None,
     )
+
+
+def test_render_summary_keeps_container_restart_action_visible():
+    outcome = replace(_named_outcome("Example"), action="container_restart")
+    summary = render_summary(RunResult((outcome,)), Redactor(), dry_run=False)
+    assert "action: container_restart" in summary
+    assert "[REDACTED]" not in summary
 
 
 def test_render_summary_flattens_injected_rows_and_headings():
