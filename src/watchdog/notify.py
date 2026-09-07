@@ -57,7 +57,7 @@ def build_email(outcome: TargetOutcome, kind: str, redactor: Redactor) -> tuple[
     action = outcome.action
     elapsed = f"{outcome.elapsed_seconds:.2f}s"
     verdict = "recovered" if kind == "recovery" else "unrecovered"
-    headline = "Recovery succeeded" if kind == "recovery" else "Unrecoverable failure"
+    headline = "Recovery succeeded" if kind == "recovery" else "Recovery failed"
     accent = "#3fb950" if kind == "recovery" else "#f85149"
 
     subject = f"[watchdog] {headline} — {service} ({classification})"
@@ -69,6 +69,8 @@ def build_email(outcome: TargetOutcome, kind: str, redactor: Redactor) -> tuple[
         "Elapsed": elapsed,
         "Result": verdict,
     }
+    if outcome.failure_reason is not None:
+        rows["Reason"] = outcome.failure_reason.value
     # HTML-escape every rendered value so no value can inject markup.
     row_html = "".join(
         f'<tr><td style="padding:6px 14px;color:#8b949e">{html_escape(k)}</td>'
@@ -97,6 +99,8 @@ def build_email(outcome: TargetOutcome, kind: str, redactor: Redactor) -> tuple[
         f"Elapsed: {elapsed}\n"
         f"Result: {verdict}\n"
     )
+    if outcome.failure_reason is not None:
+        text += f"Reason: {outcome.failure_reason.value}\n"
     # Defence in depth: redact the fully-rendered strings too.
     return redactor.redact(subject), redactor.redact(html), redactor.redact(text)
 
