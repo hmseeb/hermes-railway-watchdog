@@ -7,6 +7,8 @@ here should carry a raw secret, id, name, URL, or response body.
 
 from __future__ import annotations
 
+from enum import StrEnum
+
 
 class WatchdogError(Exception):
     """Base class for all watchdog errors."""
@@ -79,3 +81,26 @@ class HermesProtocolError(HermesError):
 
 class NotificationError(WatchdogError):
     """A notification could not be delivered."""
+
+
+class FailureReason(StrEnum):
+    AUTH = "gateway_authentication_failed"
+    TIMEOUT = "gateway_timeout"
+    PROTOCOL = "gateway_protocol_error"
+    HTTP = "gateway_http_error"
+    RAILWAY = "railway_request_failed"
+    INTERNAL = "unexpected_error"
+
+
+def failure_reason(error: Exception) -> FailureReason:
+    """Only fixed codes may leave the process; never exception text or payloads."""
+    for kind, reason in (
+        (HermesAuthError, FailureReason.AUTH),
+        (HermesTimeoutError, FailureReason.TIMEOUT),
+        (HermesProtocolError, FailureReason.PROTOCOL),
+        (HermesHTTPError, FailureReason.HTTP),
+        (RailwayError, FailureReason.RAILWAY),
+    ):
+        if isinstance(error, kind):
+            return reason
+    return FailureReason.INTERNAL

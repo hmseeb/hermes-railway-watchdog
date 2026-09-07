@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from typing import Protocol
 
 from .config import Target, WatchdogConfig
-from .errors import HermesError
+from .errors import FailureReason, HermesError, failure_reason
 from .hermes import HealthResult
 from .http import Budget, Deadline
 from .railway import DeploymentStatus, ServiceStatus
@@ -57,6 +57,7 @@ class TargetOutcome:
     deferred: bool
     elapsed_seconds: float
     error: str | None
+    failure_reason: FailureReason | None = None
 
 
 @dataclass(frozen=True)
@@ -152,7 +153,7 @@ class Orchestrator:
             # Any unexpected failure (parser, factory, transport, bug) is isolated to
             # this target and sanitized — other targets keep their outcomes.
             return self._done(target, cls, "none", False, False, start,
-                              error=self._redactor.redact_exc(err))
+                              error=self._redactor.redact_exc(err), reason=failure_reason(err))
         finally:
             if hermes is not None:
                 self._safe_close(hermes)
@@ -176,6 +177,7 @@ class Orchestrator:
         deferred: bool,
         start: float,
         error: str | None = None,
+        reason: FailureReason | None = None,
     ) -> TargetOutcome:
         return TargetOutcome(
             alias=target.alias,
@@ -186,6 +188,7 @@ class Orchestrator:
             deferred=deferred,
             elapsed_seconds=round(self._monotonic() - start, 3),
             error=error,
+            failure_reason=reason,
         )
 
     # -- recovery strategies --------------------------------------------------

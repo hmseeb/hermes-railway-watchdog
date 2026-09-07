@@ -12,6 +12,7 @@ from watchdog.errors import (
     HermesTimeoutError,
 )
 from watchdog.hermes import HealthResult, HermesClient
+from watchdog.http import Budget
 
 BASE = "https://gw.hermes.test"
 HEALTH_URL = f"{BASE}/health"
@@ -103,7 +104,7 @@ def _restart_router(login_response, restart_response, health_sequence):
 
     def handler(req: httpx.Request) -> httpx.Response:
         path = req.url.path
-        if path == "/login":
+        if path == "/setup/login":
             return login_response(req)
         if path == "/setup/api/gateway/restart":
             return restart_response(req)
@@ -266,3 +267,64 @@ def test_secrets_never_leak_in_exceptions():
     assert body_marker not in str(ei.value)
     assert "SECRETCOOKIEVALUE" not in str(ei.value)
     assert BASE not in str(ei.value)
+
+
+@pytest.mark.parametrize("legacy_status", [None, 404, 405])
+def test_current_login_and_legacy_fallback(legacy_status):
+    paths = []
+
+    def handler(req):
+        paths.append(req.url.path)
+        if req.url.path == "/setup/login":
+            return _login_ok(req) if legacy_status is None else httpx.Response(legacy_status)
+        if req.url.path == "/login":
+            # New templates proxy this obsolete route to an authenticated dashboard.
+            return httpx.Response(401) if legacy_status is None else _login_ok(req)
+        if req.url.path == "/setup/api/gateway/restart":
+            assert "hermes_auth=" in req.headers.get("cookie", "")
+            return httpx.Response(200, json={"ok": True})
+        return _health("ok", "running")
+
+    with _client(handler) as client:
+        assert client.restart_gateway(USER, PASSWORD)
+    expected = ["/setup/login"] + (["/login"] if legacy_status is not None else [])
+    assert paths == [*expected, "/setup/api/gateway/restart", "/health"]
+
+
+@pytest.mark.parametrize("status", [401, 403, 500])
+def test_login_rejection_does_not_try_other_paths_or_restart(status):
+    paths = []
+
+    def handler(req):
+        paths.append(req.url.path)
+        return httpx.Response(status)
+
+    with _client(handler) as client, pytest.raises(HermesAuthError):
+        client.restart_gateway(USER, PASSWORD)
+    assert paths == ["/setup/login"]
+
+
+def test_restart_poll_requires_full_health():
+    handler, state = _restart_router(
+        _login_ok, lambda req: httpx.Response(200, json={"ok": True}),
+        [_health("degraded", "running"), _health("ok", "running")],
+    )
+    with _client(handler) as client:
+        assert client.restart_gateway(USER, PASSWORD)
+    assert state["health_calls"] == 2
+
+
+@pytest.mark.parametrize("status", [404, 405])
+def test_expired_budget_prevents_legacy_login_fallback(status):
+    clock = [0.0]
+    deadline = Budget(lambda: clock[0], 1.0)
+    paths = []
+
+    def handler(req):
+        paths.append(req.url.path)
+        clock[0] = 2.0
+        return httpx.Response(status)
+
+    with _client(handler) as client, pytest.raises(HermesTimeoutError):
+        client.restart_gateway(USER, PASSWORD, deadline=deadline)
+    assert paths == ["/setup/login"]

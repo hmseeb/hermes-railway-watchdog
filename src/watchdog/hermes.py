@@ -29,7 +29,7 @@ from .errors import (
 )
 from .http import Deadline, Timeouts
 
-_LOGIN_PATH = "/login"
+_LOGIN_PATH = "/setup/login"
 _RESTART_PATH = "/setup/api/gateway/restart"
 _AUTH_COOKIE = "hermes_auth"
 
@@ -182,6 +182,13 @@ class HermesClient:
             client, "POST", self._base + _LOGIN_PATH, deadline=deadline,
             data={"username": username, "password": password, "returnTo": "/"},
         )
+        # Older templates served /login directly. Only fall back when the current
+        # route is absent, never on rejected credentials or an unsafe redirect.
+        if response.status_code in (404, 405):
+            response = await self._async_request(
+                client, "POST", self._base + "/login", deadline=deadline,
+                data={"username": username, "password": password, "returnTo": "/"},
+            )
         if response.status_code != 302:
             raise HermesAuthError(f"hermes login unexpected status (HTTP {response.status_code})")
         if "error=1" in response.headers.get("location", ""):
@@ -213,7 +220,7 @@ class HermesClient:
                 response = await self._async_request(
                     client, "GET", self._health_url, deadline=deadline
                 )
-                if self._parse_health(response).gateway_running:
+                if self._parse_health(response).healthy:
                     return True
             except (HermesHTTPError, HermesTimeoutError, HermesProtocolError):
                 pass  # transient during restart; keep polling within the bound
