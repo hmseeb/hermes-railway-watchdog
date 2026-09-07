@@ -106,7 +106,7 @@ def render_summary(result: RunResult, redactor: Redactor, *, dry_run: bool) -> s
         name = sanitize_markdown_inline(redactor.redact(o.service_name))
         reason = f" | reason: {o.failure_reason.value}" if o.failure_reason is not None else ""
         lines.append(
-            f"- {name}: {cls} | action={o.action} | "
+            f"- {name}: {cls} | action: {o.action} | "
             f"elapsed={o.elapsed_seconds:.2f}s{reason} | {verdict}"
         )
     unrecovered = result.unrecovered()
