@@ -1,6 +1,8 @@
-"""Phase 3 (RED first): Hermes gateway client — health + authenticated restart."""
-
+"""Hermes native-dashboard client — authenticated status + gateway restart."""
 from __future__ import annotations
+
+import json
+from typing import Any
 
 import httpx
 import pytest
@@ -15,22 +17,38 @@ from watchdog.hermes import HealthResult, HermesClient
 from watchdog.http import Budget
 
 BASE = "https://gw.hermes.test"
-HEALTH_URL = f"{BASE}/health"
+HEALTH_URL = f"{BASE}/api/status"
+LOGIN = "/auth/password-login"
+RESTART = "/api/gateway/restart"
+STATUS = "/api/status"
 USER = "admin-user"
-# Minimal non-secret form value: exercises the login form/redaction paths without
-# resembling a real credential (avoids secret-scanning false alarms).
+# Minimal non-secret value: exercises the login/redaction paths without resembling
+# a real credential (avoids secret-scanning false alarms).
 PASSWORD = "p"
-# The deployed template sets this cookie on a successful 302 login.
-COOKIE = "hermes_auth=SECRETCOOKIEVALUE1234567890abcdef; Path=/; HttpOnly"
+# The native dashboard sets one or more hermes_session* cookies on a 200 login.
+COOKIE = "hermes_session=SECRETCOOKIEVALUE1234567890abcdef; Path=/; HttpOnly"
 
 
 def _login_ok(req: httpx.Request) -> httpx.Response:
-    return httpx.Response(302, headers={"set-cookie": COOKIE, "location": "/"})
+    return httpx.Response(200, json={"ok": True}, headers={"set-cookie": COOKIE})
+
+
+def _status(running: bool, authed: bool = True) -> httpx.Response:
+    if not authed:
+        return httpx.Response(401, json={"error": "unauthorized"})
+    return httpx.Response(200, json={
+        "gateway_running": running,
+        "gateway_state": "running" if running else "stopped",
+        "gateway_platforms": {},
+        "version": "test",
+    })
 
 
 def _client(handler, **kw) -> HermesClient:
     return HermesClient(
         health_url=HEALTH_URL,
+        username=USER,
+        password=PASSWORD,
         transport=httpx.MockTransport(handler),
         sleep=lambda _s: None,
         poll_attempts=kw.pop("poll_attempts", 3),
@@ -39,283 +57,274 @@ def _client(handler, **kw) -> HermesClient:
     )
 
 
+def _router(login_response, restart_response, status_sequence, *, require_cookie=True):
+    """Route by path; /api/status returns successive bodies from status_sequence."""
+    state: dict[str, Any] = {"status_calls": 0, "login_calls": 0, "restart_calls": 0, "paths": []}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        path = req.url.path
+        state["paths"].append(path)
+        authed = "hermes_session=" in req.headers.get("cookie", "")
+        if path == LOGIN:
+            state["login_calls"] += 1
+            return login_response(req)
+        if path == RESTART:
+            state["restart_calls"] += 1
+            if require_cookie and not authed:
+                return httpx.Response(401)
+            return restart_response(req)
+        if path == STATUS:
+            if require_cookie and not authed:
+                return httpx.Response(401)
+            i = min(state["status_calls"], len(status_sequence) - 1)
+            state["status_calls"] += 1
+            return status_sequence[i]
+        return httpx.Response(404)
+
+    return handler, state
+
+
 # --- health -------------------------------------------------------------------
 
-def _health(status: str, gateway: str) -> httpx.Response:
-    return httpx.Response(200, json={"status": status, "gateway": gateway})
 
+def test_health_logs_in_then_reads_status():
+    seen: dict[str, str] = {}
 
-def test_health_healthy():
-    with _client(lambda req: _health("ok", "running")) as c:
+    def login(req):
+        seen["ct"] = req.headers.get("content-type", "")
+        seen["body"] = req.content.decode()
+        return _login_ok(req)
+
+    handler, state = _router(login, _login_ok, [_status(True)])
+    with _client(handler) as c:
         r = c.check_health()
     assert isinstance(r, HealthResult)
-    assert r.status_ok is True
-    assert r.gateway_running is True
-    assert r.healthy is True
+    assert r.status_ok is True and r.gateway_running is True and r.healthy is True
+    assert state["paths"] == [LOGIN, STATUS]
+    assert "application/json" in seen["ct"]
+    assert json.loads(seen["body"]) == {
+        "provider": "basic", "username": USER, "password": PASSWORD,
+    }
+
+
+def test_health_session_reused_across_calls():
+    handler, state = _router(_login_ok, _login_ok, [_status(True)])
+    with _client(handler) as c:
+        c.check_health()
+        c.check_health()
+    assert state["login_calls"] == 1
+    assert state["status_calls"] == 2
+
+
+def test_health_relogins_once_on_401():
+    calls = {"status": 0}
+
+    def handler(req):
+        if req.url.path == LOGIN:
+            return _login_ok(req)
+        calls["status"] += 1
+        return _status(True, authed=calls["status"] != 2)  # second read: expired
+
+    with _client(handler) as c:
+        c.check_health()
+        assert c.check_health().healthy is True
+    assert calls["status"] == 3
+
+
+def test_health_persistent_401_raises_auth():
+    handler, _ = _router(_login_ok, _login_ok, [_status(True)], require_cookie=False)
+
+    def h(req):
+        return httpx.Response(401) if req.url.path == STATUS else handler(req)
+
+    with _client(h) as c, pytest.raises(HermesAuthError):
+        c.check_health()
 
 
 def test_health_gateway_not_running():
-    with _client(lambda req: _health("ok", "stopped")) as c:
+    handler, _ = _router(_login_ok, _login_ok, [_status(False)])
+    with _client(handler) as c:
         r = c.check_health()
     assert r.status_ok is True
     assert r.gateway_running is False
     assert r.healthy is False
 
 
-def test_health_status_not_ok():
-    with _client(lambda req: _health("degraded", "running")) as c:
-        r = c.check_health()
-    assert r.status_ok is False
-    assert r.healthy is False
+def test_health_gateway_running_must_be_bool_true():
+    handler, _ = _router(
+        _login_ok, _login_ok, [httpx.Response(200, json={"gateway_running": "yes"})]
+    )
+    with _client(handler) as c:
+        assert c.check_health().gateway_running is False
 
 
 def test_health_non_200_raises_http():
-    with _client(lambda req: httpx.Response(503, text="down")) as c:
-        with pytest.raises(HermesHTTPError):
-            c.check_health()
+    handler, _ = _router(_login_ok, _login_ok, [httpx.Response(503, text="down")])
+    with _client(handler) as c, pytest.raises(HermesHTTPError):
+        c.check_health()
 
 
 def test_health_timeout_raises():
     def handler(req):
         raise httpx.ReadTimeout("t", request=req)
 
-    with _client(handler) as c:
-        with pytest.raises(HermesTimeoutError):
-            c.check_health()
+    with _client(handler) as c, pytest.raises(HermesTimeoutError):
+        c.check_health()
 
 
 def test_health_malformed_json_raises_protocol():
-    with _client(lambda req: httpx.Response(200, text="not json")) as c:
-        with pytest.raises(HermesProtocolError):
-            c.check_health()
+    handler, _ = _router(_login_ok, _login_ok, [httpx.Response(200, text="not json")])
+    with _client(handler) as c, pytest.raises(HermesProtocolError):
+        c.check_health()
 
 
 def test_health_non_object_json_raises_protocol():
-    with _client(lambda req: httpx.Response(200, json=[1, 2, 3])) as c:
-        with pytest.raises(HermesProtocolError):
-            c.check_health()
+    handler, _ = _router(_login_ok, _login_ok, [httpx.Response(200, json=[1, 2, 3])])
+    with _client(handler) as c, pytest.raises(HermesProtocolError):
+        c.check_health()
+
+
+# --- login --------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("status", [401, 403, 500])
+def test_login_non_200_raises_auth_and_never_restarts(status):
+    handler, state = _router(
+        lambda req: httpx.Response(status, text="denied"), _login_ok, [_status(True)]
+    )
+    with _client(handler) as c, pytest.raises(HermesAuthError):
+        c.restart_gateway(USER, PASSWORD)
+    assert state["restart_calls"] == 0
+
+
+def test_login_ok_false_raises_auth():
+    handler, state = _router(
+        lambda req: httpx.Response(200, json={"ok": False}, headers={"set-cookie": COOKIE}),
+        _login_ok, [_status(True)],
+    )
+    with _client(handler) as c, pytest.raises(HermesAuthError):
+        c.restart_gateway(USER, PASSWORD)
+    assert state["restart_calls"] == 0
+
+
+def test_login_without_session_cookie_raises_auth():
+    handler, state = _router(
+        lambda req: httpx.Response(200, json={"ok": True}), _login_ok, [_status(True)]
+    )
+    with _client(handler) as c, pytest.raises(HermesAuthError):
+        c.restart_gateway(USER, PASSWORD)
+    assert state["restart_calls"] == 0
+
+
+def test_login_non_json_raises_auth():
+    handler, _ = _router(
+        lambda req: httpx.Response(200, text="<html>", headers={"set-cookie": COOKIE}),
+        _login_ok, [_status(True)],
+    )
+    with _client(handler) as c, pytest.raises(HermesAuthError):
+        c.check_health()
+
+
+def test_login_rejects_cross_origin_redirect():
+    handler, state = _router(
+        lambda req: httpx.Response(302, headers={"location": "https://evil.other.test/x"}),
+        _login_ok, [_status(True)],
+    )
+    with _client(handler) as c, pytest.raises(HermesProtocolError):
+        c.restart_gateway(USER, PASSWORD)
+    assert state["restart_calls"] == 0
 
 
 # --- restart ------------------------------------------------------------------
 
-def _restart_router(login_response, restart_response, health_sequence):
-    """Route by path; /health returns successive bodies from health_sequence."""
-    state = {"health_calls": 0}
 
-    def handler(req: httpx.Request) -> httpx.Response:
-        path = req.url.path
-        if path == "/setup/login":
-            return login_response(req)
-        if path == "/setup/api/gateway/restart":
-            return restart_response(req)
-        if path == "/health":
-            i = min(state["health_calls"], len(health_sequence) - 1)
-            state["health_calls"] += 1
-            return health_sequence[i]
-        return httpx.Response(404)
-
-    return handler, state
-
-
-def test_restart_happy_path_form_login_cookie_then_polls():
+def test_restart_happy_path_login_cookie_then_polls():
     seen: dict[str, str] = {}
 
-    def login(req):
-        seen["login_ct"] = req.headers.get("content-type", "")
-        seen["login_body"] = req.content.decode()
-        return _login_ok(req)
-
     def restart(req):
-        seen["restart_cookie"] = req.headers.get("cookie") or ""
+        seen["cookie"] = req.headers.get("cookie") or ""
         return httpx.Response(200, json={"ok": True})
 
-    handler, _ = _restart_router(
-        login, restart, [_health("ok", "stopped"), _health("ok", "running")]
-    )
+    handler, state = _router(_login_ok, restart, [_status(False), _status(True)])
     with _client(handler) as c:
         assert c.restart_gateway(USER, PASSWORD) is True
-    # Login is form-encoded with username, password, returnTo=/.
-    assert "application/x-www-form-urlencoded" in seen["login_ct"]
-    assert "username=" in seen["login_body"]
-    assert "password=" in seen["login_body"]
-    assert "returnTo=%2F" in seen["login_body"] or "returnTo=/" in seen["login_body"]
-    # The hermes_auth cookie is retained and replayed on the restart call.
-    assert "hermes_auth=" in seen.get("restart_cookie", "")
+    assert "hermes_session=" in seen["cookie"]
+    assert state["paths"] == [LOGIN, RESTART, STATUS, STATUS]
 
 
-def test_restart_login_non_302_raises_auth():
-    handler, _ = _restart_router(
-        lambda req: httpx.Response(200, headers={"set-cookie": COOKIE}),  # 200, not 302
-        lambda req: httpx.Response(200),
-        [_health("ok", "running")],
-    )
+def test_restart_reuses_session_from_health():
+    handler, state = _router(_login_ok, _login_ok, [_status(False), _status(True)])
     with _client(handler) as c:
-        with pytest.raises(HermesAuthError):
-            c.restart_gateway(USER, PASSWORD)
+        assert c.check_health().healthy is False
+        assert c.restart_gateway(USER, PASSWORD) is True
+    assert state["login_calls"] == 1
 
 
-def test_restart_login_error_redirect_raises_and_does_not_restart():
-    restart_called = {"n": 0}
+def test_restart_relogins_once_on_401():
+    handler, state = _router(_login_ok, _login_ok, [_status(True)])
+    first = {"seen": False}
 
-    def login(req):
-        # Same-origin redirect back to /login?error=1 — a failed login.
-        return httpx.Response(302, headers={"location": "/login?error=1"})
+    def h(req):
+        if req.url.path == RESTART and not first["seen"]:
+            first["seen"] = True
+            return httpx.Response(401)  # session expired between health and restart
+        return handler(req)
 
-    def restart(req):
-        restart_called["n"] += 1
-        return httpx.Response(200)
-
-    handler, _ = _restart_router(login, restart, [_health("ok", "running")])
-    with _client(handler) as c:
-        with pytest.raises(HermesAuthError):
-            c.restart_gateway(USER, PASSWORD)
-    assert restart_called["n"] == 0
-
-
-def test_restart_login_302_without_auth_cookie_raises():
-    restart_called = {"n": 0}
-
-    def login(req):
-        return httpx.Response(302, headers={"location": "/"})  # no Set-Cookie
-
-    def restart(req):
-        restart_called["n"] += 1
-        return httpx.Response(200)
-
-    handler, _ = _restart_router(login, restart, [_health("ok", "running")])
-    with _client(handler) as c:
-        with pytest.raises(HermesAuthError):
-            c.restart_gateway(USER, PASSWORD)
-    assert restart_called["n"] == 0  # no auth cookie → never restart
-
-
-def test_restart_rejects_cross_origin_redirect_on_login():
-    def login(req):
-        return httpx.Response(302, headers={"location": "https://evil.other.test/steal"})
-
-    restart_called = {"n": 0}
-
-    def restart(req):
-        restart_called["n"] += 1
-        return httpx.Response(200)
-
-    handler, _ = _restart_router(login, restart, [_health("ok", "running")])
-    with _client(handler) as c:
-        with pytest.raises(HermesProtocolError):
-            c.restart_gateway(USER, PASSWORD)
-    assert restart_called["n"] == 0  # must not proceed to restart
+    with _client(h) as c:
+        c.check_health()
+        assert c.restart_gateway(USER, PASSWORD) is True
+    assert state["login_calls"] == 2
+    assert state["restart_calls"] == 1  # the first 401 was intercepted before routing
 
 
 def test_restart_endpoint_http_error_raises():
-    handler, _ = _restart_router(
-        _login_ok,
-        lambda req: httpx.Response(500, text="boom"),
-        [_health("ok", "running")],
-    )
+    handler, _ = _router(_login_ok, lambda req: httpx.Response(500, text="boom"), [_status(True)])
+    with _client(handler) as c, pytest.raises(HermesHTTPError):
+        c.restart_gateway(USER, PASSWORD)
+
+
+@pytest.mark.parametrize("body", [{"ok": False}, {"error": "busy"}])
+def test_restart_body_reporting_failure_is_failure(body):
+    handler, _ = _router(_login_ok, lambda req: httpx.Response(200, json=body), [_status(True)])
+    with _client(handler) as c, pytest.raises(HermesHTTPError):
+        c.restart_gateway(USER, PASSWORD)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [httpx.Response(200, json={"ok": True}), httpx.Response(202, json={"status": "queued"}),
+     httpx.Response(204)],
+)
+def test_restart_any_2xx_without_failure_is_success(response):
+    handler, _ = _router(_login_ok, lambda req: response, [_status(True)])
     with _client(handler) as c:
-        with pytest.raises(HermesHTTPError):
-            c.restart_gateway(USER, PASSWORD)
-
-
-def test_restart_body_without_ok_true_is_failure():
-    # A 200 response that does not contain exactly {ok: true} must not be treated as
-    # a successful mutation.
-    handler, _ = _restart_router(
-        _login_ok,
-        lambda req: httpx.Response(200, json={"status": "queued"}),
-        [_health("ok", "running")],
-    )
-    with _client(handler) as c:
-        with pytest.raises(HermesHTTPError):
-            c.restart_gateway(USER, PASSWORD)
-
-
-def test_restart_body_ok_false_is_failure():
-    handler, _ = _restart_router(
-        _login_ok,
-        lambda req: httpx.Response(200, json={"ok": False}),
-        [_health("ok", "running")],
-    )
-    with _client(handler) as c:
-        with pytest.raises(HermesHTTPError):
-            c.restart_gateway(USER, PASSWORD)
+        assert c.restart_gateway(USER, PASSWORD) is True
 
 
 def test_restart_poll_never_running_times_out():
-    handler, _ = _restart_router(
-        _login_ok,
-        lambda req: httpx.Response(200, json={"ok": True}),
-        [_health("ok", "stopped")],
+    handler, state = _router(
+        _login_ok, lambda req: httpx.Response(200, json={"ok": True}), [_status(False)]
     )
-    with _client(handler, poll_attempts=2) as c:
-        with pytest.raises(HermesTimeoutError):
-            c.restart_gateway(USER, PASSWORD)
+    with _client(handler, poll_attempts=2) as c, pytest.raises(HermesTimeoutError):
+        c.restart_gateway(USER, PASSWORD)
+    assert state["status_calls"] == 2
 
 
 def test_secrets_never_leak_in_exceptions():
     # The server echoes a distinctive detail in the failed-login body; the typed
     # exception must not carry that response body, the cookie, or the base URL.
     body_marker = "server-echoed-detail-marker"
-    handler, _ = _restart_router(
-        lambda req: httpx.Response(403, text=f"denied {body_marker}"),
-        lambda req: httpx.Response(200),
-        [_health("ok", "running")],
+    handler, _ = _router(
+        lambda req: httpx.Response(403, text=f"denied {body_marker}"), _login_ok, [_status(True)]
     )
-    with _client(handler) as c:
-        with pytest.raises(HermesAuthError) as ei:
-            c.restart_gateway(USER, PASSWORD)
+    with _client(handler) as c, pytest.raises(HermesAuthError) as ei:
+        c.restart_gateway(USER, PASSWORD)
     assert body_marker not in str(ei.value)
     assert "SECRETCOOKIEVALUE" not in str(ei.value)
     assert BASE not in str(ei.value)
 
 
-@pytest.mark.parametrize("legacy_status", [None, 404, 405])
-def test_current_login_and_legacy_fallback(legacy_status):
-    paths = []
-
-    def handler(req):
-        paths.append(req.url.path)
-        if req.url.path == "/setup/login":
-            return _login_ok(req) if legacy_status is None else httpx.Response(legacy_status)
-        if req.url.path == "/login":
-            # New templates proxy this obsolete route to an authenticated dashboard.
-            return httpx.Response(401) if legacy_status is None else _login_ok(req)
-        if req.url.path == "/setup/api/gateway/restart":
-            assert "hermes_auth=" in req.headers.get("cookie", "")
-            return httpx.Response(200, json={"ok": True})
-        return _health("ok", "running")
-
-    with _client(handler) as client:
-        assert client.restart_gateway(USER, PASSWORD)
-    expected = ["/setup/login"] + (["/login"] if legacy_status is not None else [])
-    assert paths == [*expected, "/setup/api/gateway/restart", "/health"]
-
-
-@pytest.mark.parametrize("status", [401, 403, 500])
-def test_login_rejection_does_not_try_other_paths_or_restart(status):
-    paths = []
-
-    def handler(req):
-        paths.append(req.url.path)
-        return httpx.Response(status)
-
-    with _client(handler) as client, pytest.raises(HermesAuthError):
-        client.restart_gateway(USER, PASSWORD)
-    assert paths == ["/setup/login"]
-
-
-def test_restart_poll_requires_full_health():
-    handler, state = _restart_router(
-        _login_ok, lambda req: httpx.Response(200, json={"ok": True}),
-        [_health("degraded", "running"), _health("ok", "running")],
-    )
-    with _client(handler) as client:
-        assert client.restart_gateway(USER, PASSWORD)
-    assert state["health_calls"] == 2
-
-
-@pytest.mark.parametrize("status", [404, 405])
-def test_expired_budget_prevents_legacy_login_fallback(status):
+def test_expired_budget_prevents_status_after_login():
     clock = [0.0]
     deadline = Budget(lambda: clock[0], 1.0)
     paths = []
@@ -323,8 +332,8 @@ def test_expired_budget_prevents_legacy_login_fallback(status):
     def handler(req):
         paths.append(req.url.path)
         clock[0] = 2.0
-        return httpx.Response(status)
+        return _login_ok(req)
 
     with _client(handler) as client, pytest.raises(HermesTimeoutError):
-        client.restart_gateway(USER, PASSWORD, deadline=deadline)
-    assert paths == ["/setup/login"]
+        client.check_health(deadline=deadline)
+    assert paths == [LOGIN]

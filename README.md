@@ -40,10 +40,10 @@ target creds ─▶ hermes ────────────▶└───�
   deployment status/instance state; restarts the *current* deployment via
   `deploymentRestart` (no rebuild, no shell, no SSH). Bounded timeouts; retries safe
   reads only.
-- **`hermes`** — public `/health` check (requires `status=ok` + `gateway=running`);
-  authenticated gateway restart via `/setup/login` (legacy `/login` fallback only
-  on 404/405) → session cookie → `/setup/api/gateway/restart`
-  → poll for full health. Redirects are not followed; cross-origin redirects are rejected.
+- **`hermes`** — native-dashboard client. Authenticated `/api/status` check
+  (`health_url`; requires `gateway_running: true`); JSON login via
+  `/auth/password-login` → `hermes_session*` cookies (lazy, once per client,
+  re-login once on 401) → `/api/gateway/restart` → poll `/api/status` for health. Redirects are not followed; cross-origin redirects are rejected.
 - **`state`** — classifies each target as `healthy`, `gateway_only_failure`,
   `transitional`, or `container_failure` (15-minute transition threshold).
 - **`orchestrator`** — per-target recovery with a fresh-state recheck before every
@@ -123,8 +123,8 @@ watchdog --dry-run --service svc-a # select one target by its internal opaque al
 5. Enable the schedule only on the default branch after merge.
 6. Contracts confirmed against the live/deployed services: Railway
    `serviceInstance` query + `deploymentRestart` mutation (endpoint
-   `backboard.railway.com`), Hermes form-encoded `/setup/login` → `hermes_auth` cookie →
-   restart, and the AgentMail send/list endpoints. Smoke-test with `--dry-run` before
+   `backboard.railway.com`), Hermes JSON `/auth/password-login` → `hermes_session*`
+   cookies → `/api/gateway/restart`, and the AgentMail send/list endpoints. Smoke-test with `--dry-run` before
    enabling live mutations.
 
 ## CI/CD workflows
