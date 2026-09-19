@@ -123,19 +123,19 @@ def _hermes_router(*, login_delay=0.0, restart_delay=0.0, health_delay=0.0,
                    gateway="running", record=None):
     async def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
-        if path == "/login":
+        if path == "/auth/password-login":
             await asyncio.sleep(login_delay)
             return httpx.Response(
-                302, headers={"set-cookie": "hermes_auth=SECRET", "location": "/"}
+                200, json={"ok": True}, headers={"set-cookie": "hermes_session=SECRET; Path=/"}
             )
-        if path == "/setup/api/gateway/restart":
+        if path == "/api/gateway/restart":
             await asyncio.sleep(restart_delay)
             if record is not None:
                 record["restart_cookie"] = request.headers.get("cookie", "")
             return httpx.Response(200, json={"ok": True})
         if path == "/health":
             await asyncio.sleep(health_delay)
-            return httpx.Response(200, json={"status": "ok", "gateway": gateway})
+            return httpx.Response(200, json={"gateway_running": gateway == "running"})
         return httpx.Response(404)
 
     return handler
@@ -148,7 +148,7 @@ def test_hermes_restart_cookie_reaches_restart_within_budget():
         poll_attempts=3, poll_interval=0.0,
     )
     assert client.restart_gateway("u", "p", deadline=RealDeadline(LONG)) is True
-    assert "hermes_auth=" in record["restart_cookie"]  # cookie persisted login -> restart
+    assert "hermes_session=" in record["restart_cookie"]  # cookie persisted login -> restart
 
 
 def test_hermes_health_poll_stops_at_wall_deadline():

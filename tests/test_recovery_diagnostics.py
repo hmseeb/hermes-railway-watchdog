@@ -27,15 +27,17 @@ def test_real_http_recovery_failure_has_safe_reason_in_summary_and_alert(stage, 
         nonlocal restarted
         paths.append(request.url.path)
         if request.url.path == "/health":
-            return httpx.Response(200, json={"status": "ok", "gateway": "stopped"})
-        if request.url.path == "/setup/login":
+            return httpx.Response(200, json={"gateway_running": False})
+        if request.url.path == "/auth/password-login":
+            if stage == "login" and restarted:  # session expired at restart; re-login denied
+                return httpx.Response(401, text=secret)
+            return httpx.Response(200, json={"ok": True}, headers={
+                "set-cookie": "hermes_session=fake; Path=/; HttpOnly",
+            })
+        if request.url.path == "/api/gateway/restart":
+            restarted = True
             if stage == "login":
                 return httpx.Response(401, text=secret)
-            return httpx.Response(302, headers={
-                "location": "/", "set-cookie": "hermes_auth=fake; Path=/; HttpOnly",
-            })
-        if request.url.path == "/setup/api/gateway/restart":
-            restarted = True
             if stage == "restart":
                 return httpx.Response(500, text=secret)
             return httpx.Response(200, json={"ok": True})
@@ -49,8 +51,8 @@ def test_real_http_recovery_failure_has_safe_reason_in_summary_and_alert(stage, 
     outcome = result.outcomes[0]
     assert result.exit_code == 1
     assert outcome.failure_reason is reason
-    assert restarted is (stage != "login")
-    assert paths.count("/setup/api/gateway/restart") == int(stage != "login")
+    assert restarted is True
+    assert paths.count("/api/gateway/restart") == 1
     # The orchestration fixture uses one-letter ids; don't mask letters in prose.
     redactor = Redactor([cfg.targets[0].health_url])
     summary = render_summary(result, redactor, dry_run=False)

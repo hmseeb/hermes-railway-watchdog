@@ -1,8 +1,10 @@
 """Hermes gateway client.
 
-Per-target client that checks the public ``/health`` endpoint and, when authorised,
-restarts the gateway by logging in, replaying the in-memory session cookie to the
-restart endpoint, and polling ``/health`` until the gateway reports running.
+Per-target client for the native Hermes dashboard. Health is the authenticated
+``/api/status`` endpoint (the configured ``health_url``); the client logs in lazily
+via ``/auth/password-login`` once per instance, keeps the ``hermes_session*`` cookies
+in memory, re-logs in once on a 401, and restarts the gateway via
+``/api/gateway/restart`` then polls ``/api/status`` until the gateway reports running.
 
 Secret hygiene: this module never logs. Cookies, credentials, URLs, response bodies,
 ids, and names are never placed into exception messages — errors carry only generic
@@ -29,9 +31,9 @@ from .errors import (
 )
 from .http import Deadline, Timeouts
 
-_LOGIN_PATH = "/setup/login"
-_RESTART_PATH = "/setup/api/gateway/restart"
-_AUTH_COOKIE = "hermes_auth"
+_LOGIN_PATH = "/auth/password-login"
+_RESTART_PATH = "/api/gateway/restart"
+_SESSION_COOKIE_PREFIX = "hermes_session"
 
 
 @dataclass(frozen=True)
@@ -54,6 +56,8 @@ class HermesClient:
         self,
         health_url: str,
         *,
+        username: str = "",
+        password: str = "",
         transport: httpx.AsyncBaseTransport | None = None,
         timeouts: Timeouts | None = None,
         sleep: Callable[[float], None] | None = None,
@@ -69,6 +73,9 @@ class HermesClient:
         self._sleep = sleep or time.sleep  # retained for interface compatibility
         self._timeouts = timeouts or Timeouts()
         self._transport = transport
+        self._username = username
+        self._password = password
+        self._cookies = httpx.Cookies()  # session cookies, reused across operations
 
     def __enter__(self) -> HermesClient:
         return self
@@ -82,13 +89,14 @@ class HermesClient:
         self.close()
 
     def close(self) -> None:
-        # Async clients are created and closed per operation; nothing persists here.
-        return
+        # Async clients are created and closed per operation; only cookies persist.
+        self._cookies.clear()
 
     def _new_client(self) -> httpx.AsyncClient:
         # follow_redirects=False so cross-origin redirects can be rejected explicitly.
         return httpx.AsyncClient(
             transport=self._transport,
+            cookies=self._cookies,
             timeout=self._timeouts.as_httpx(),  # configured phase limits (inner)
             follow_redirects=False,
         )
@@ -134,6 +142,8 @@ class HermesClient:
             raise HermesProtocolError("hermes returned a redirect to an untrusted origin")
 
     def _parse_health(self, response: httpx.Response) -> HealthResult:
+        if response.status_code == 401:
+            raise HermesAuthError("hermes health requires authentication")
         if response.status_code != 200:
             raise HermesHTTPError(f"hermes health returned HTTP {response.status_code}")
         try:
@@ -142,10 +152,7 @@ class HermesClient:
             raise HermesProtocolError("hermes health returned invalid JSON") from None
         if not isinstance(body, dict):
             raise HermesProtocolError("hermes health returned a non-object body")
-        return HealthResult(
-            status_ok=body.get("status") == "ok",
-            gateway_running=body.get("gateway") == "running",
-        )
+        return HealthResult(status_ok=True, gateway_running=body.get("gateway_running") is True)
 
     # -- health ---------------------------------------------------------------
 
@@ -155,8 +162,12 @@ class HermesClient:
     async def _async_check_health(self, deadline: Deadline | None) -> HealthResult:
         # Standalone health uses a bounded short-lived async client.
         async with self._new_client() as client:
-            response = await self._async_request(client, "GET", self._health_url, deadline=deadline)
-        return self._parse_health(response)
+            try:
+                return await self._async_status(
+                    client, self._username, self._password, deadline
+                )
+            finally:
+                self._cookies = client.cookies
 
     # -- restart --------------------------------------------------------------
 
@@ -168,61 +179,88 @@ class HermesClient:
     async def _async_restart_gateway(
         self, username: str, password: str, deadline: Deadline | None
     ) -> bool:
-        # One async client spans login, restart, and polling so the hermes_auth cookie
-        # set at login is replayed to the restart and health calls.
+        # One async client spans login, restart, and polling so the session cookies
+        # set at login are replayed to the restart and status calls.
         async with self._new_client() as client:
+            try:
+                await self._async_ensure_login(client, username, password, deadline)
+                await self._async_post_restart(client, username, password, deadline)
+                return await self._async_poll(client, username, password, deadline)
+            finally:
+                self._cookies = client.cookies
+
+    @staticmethod
+    def _has_session(client: httpx.AsyncClient) -> bool:
+        return any(c.name.startswith(_SESSION_COOKIE_PREFIX) for c in client.cookies.jar)
+
+    async def _async_ensure_login(
+        self, client: httpx.AsyncClient, username: str, password: str, deadline: Deadline | None
+    ) -> None:
+        if not self._has_session(client):
             await self._async_login(client, username, password, deadline)
-            await self._async_post_restart(client, deadline)
-            return await self._async_poll(client, deadline)
 
     async def _async_login(
         self, client: httpx.AsyncClient, username: str, password: str, deadline: Deadline | None
     ) -> None:
+        client.cookies.clear()
         response = await self._async_request(
             client, "POST", self._base + _LOGIN_PATH, deadline=deadline,
-            data={"username": username, "password": password, "returnTo": "/"},
+            json={"provider": "basic", "username": username, "password": password},
         )
-        # Older templates served /login directly. Only fall back when the current
-        # route is absent, never on rejected credentials or an unsafe redirect.
-        if response.status_code in (404, 405):
-            response = await self._async_request(
-                client, "POST", self._base + "/login", deadline=deadline,
-                data={"username": username, "password": password, "returnTo": "/"},
-            )
-        if response.status_code != 302:
+        if response.status_code != 200:
             raise HermesAuthError(f"hermes login unexpected status (HTTP {response.status_code})")
-        if "error=1" in response.headers.get("location", ""):
+        try:
+            body = response.json()
+        except ValueError:
+            raise HermesAuthError("hermes login returned a non-JSON body") from None
+        if not (isinstance(body, dict) and body.get("ok") is True):
             raise HermesAuthError("hermes login was rejected")
-        if client.cookies.get(_AUTH_COOKIE) is None:
+        if not self._has_session(client):
             raise HermesAuthError("hermes login did not establish an auth session")
 
+    async def _async_status(
+        self, client: httpx.AsyncClient, username: str, password: str, deadline: Deadline | None
+    ) -> HealthResult:
+        await self._async_ensure_login(client, username, password, deadline)
+        response = await self._async_request(client, "GET", self._health_url, deadline=deadline)
+        if response.status_code == 401:  # session expired/revoked: re-login once
+            await self._async_login(client, username, password, deadline)
+            response = await self._async_request(
+                client, "GET", self._health_url, deadline=deadline
+            )
+        return self._parse_health(response)
+
     async def _async_post_restart(
-        self, client: httpx.AsyncClient, deadline: Deadline | None
+        self, client: httpx.AsyncClient, username: str, password: str, deadline: Deadline | None
     ) -> None:
         response = await self._async_request(
             client, "POST", self._base + _RESTART_PATH, deadline=deadline
         )
+        if response.status_code == 401:  # session expired/revoked: re-login once
+            await self._async_login(client, username, password, deadline)
+            response = await self._async_request(
+                client, "POST", self._base + _RESTART_PATH, deadline=deadline
+            )
         if response.status_code >= 400:
             raise HermesHTTPError(f"hermes restart returned HTTP {response.status_code}")
-        # The restart is only confirmed by an exact {"ok": true} body.
+        # Any 2xx is success unless a JSON body explicitly reports failure.
         try:
             body = response.json()
         except ValueError:
-            raise HermesHTTPError("hermes restart returned a non-JSON body") from None
-        if not (isinstance(body, dict) and body.get("ok") is True):
-            raise HermesHTTPError("hermes restart did not confirm success")
+            return
+        if isinstance(body, dict) and (body.get("ok") is False or "error" in body):
+            raise HermesHTTPError("hermes restart reported failure")
 
-    async def _async_poll(self, client: httpx.AsyncClient, deadline: Deadline | None) -> bool:
+    async def _async_poll(
+        self, client: httpx.AsyncClient, username: str, password: str, deadline: Deadline | None
+    ) -> bool:
         for attempt in range(self._poll_attempts):
             if deadline is not None and deadline.remaining() <= 0:
                 break  # refuse to start a poll once the budget is spent
             try:
-                response = await self._async_request(
-                    client, "GET", self._health_url, deadline=deadline
-                )
-                if self._parse_health(response).healthy:
+                if (await self._async_status(client, username, password, deadline)).healthy:
                     return True
-            except (HermesHTTPError, HermesTimeoutError, HermesProtocolError):
+            except (HermesHTTPError, HermesTimeoutError, HermesProtocolError, HermesAuthError):
                 pass  # transient during restart; keep polling within the bound
             if attempt < self._poll_attempts - 1:
                 await asyncio.sleep(self._clip_sleep(self._poll_interval, deadline))

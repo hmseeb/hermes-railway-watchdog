@@ -78,7 +78,9 @@ def _default_runtime(config: WatchdogConfig, redactor: Redactor, dry_run: bool) 
     orchestrator = Orchestrator(
         config=config,
         railway=railway,
-        hermes_factory=lambda t: HermesClient(t.health_url),
+        hermes_factory=lambda t: HermesClient(
+            t.health_url, username=t.admin_username, password=t.admin_password
+        ),
         redactor=redactor,
         now=lambda: datetime.now(UTC),
         monotonic=time.monotonic,
