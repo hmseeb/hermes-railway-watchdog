@@ -71,10 +71,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _default_runtime(config: WatchdogConfig, redactor: Redactor, dry_run: bool) -> Runtime:
-    token = os.environ.get("RAILWAY_API_TOKEN")
-    if not token:
-        raise ConfigError("RAILWAY_API_TOKEN is not set")
-    railway = RailwayClient(token)
+    railway: RailwayClient | None = None
+    if not config.selfhosted:  # self-hosted mode never builds (or needs) a Railway client
+        token = os.environ.get("RAILWAY_API_TOKEN")
+        if not token:
+            raise ConfigError("RAILWAY_API_TOKEN is not set")
+        railway = RailwayClient(token)
     orchestrator = Orchestrator(
         config=config,
         railway=railway,
@@ -87,16 +89,22 @@ def _default_runtime(config: WatchdogConfig, redactor: Redactor, dry_run: bool) 
         sleep=time.sleep,
         dry_run=dry_run,
     )
-    notifier = build_notifier_from_env(redactor)
+    notifier = build_notifier_from_env(redactor, selfhosted=config.selfhosted)
     # The Railway client and the notifier's AgentMail client must be closed after the
     # run; Hermes clients are closed per-target by the orchestrator.
-    return Runtime(orchestrator=orchestrator, notifier=notifier, closeables=(railway, notifier))
+    closeables = (notifier,) if railway is None else (railway, notifier)
+    return Runtime(orchestrator=orchestrator, notifier=notifier, closeables=closeables)
 
 
 def render_summary(result: RunResult, redactor: Redactor, *, dry_run: bool) -> str:
     mode = "dry-run" if dry_run else "live"
     lines = [f"# Watchdog run ({mode})", ""]
-    for o in result.outcomes:
+    if result.host_down:
+        lines.append(
+            f"- HOST DOWN: all {len(result.outcomes)} targets are unreachable. The whole "
+            "host (the Mac mini, or its power/internet) appears to be down."
+        )
+    for o in () if result.host_down else result.outcomes:
         verdict = "PASS" if (o.recovered or o.deferred) else "FAIL"
         cls = o.classification.value if o.classification else "unknown"
         # service_name is operator-chosen free text. Redact it FIRST — while any secret
@@ -107,6 +115,8 @@ def render_summary(result: RunResult, redactor: Redactor, *, dry_run: bool) -> s
         # depth; the resulting [REDACTED] mask is itself Markdown-escaped here.
         name = sanitize_markdown_inline(redactor.redact(o.service_name))
         reason = f" | reason: {o.failure_reason.value}" if o.failure_reason is not None else ""
+        if o.detail:  # redact first, then sanitize (same order as the name above)
+            reason += f" | {sanitize_markdown_inline(redactor.redact(o.detail))}"
         lines.append(
             f"- {name}: {cls} | action: {o.action} | "
             f"elapsed={o.elapsed_seconds:.2f}s{reason} | {verdict}"

@@ -11,6 +11,12 @@ All email content is public-safe: the operator-chosen service name (intentionall
 public), broad classifications, action names, elapsed time, and pass/fail — every field
 passes through the central redactor, which still masks all other production detail.
 Incident deduplication keys stay opaque (a hash of the internal alias).
+
+Self-hosted mode additionally: an incident marker carries an opaque hash of the
+target's *condition*, so a changed condition (e.g. web UI down → platform degraded)
+alerts once more; a passive recovery sends one "resolved" email; and when every target
+is unreachable a single host-down alert replaces the per-target ones. State persists
+between runs only via those inbox markers — no runner cache or artifact.
 """
 
 from __future__ import annotations
@@ -19,7 +25,7 @@ import hashlib
 import os
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from html import escape as html_escape
 from types import TracebackType
 from typing import Any
@@ -30,6 +36,7 @@ from .errors import NotificationError
 from .http import Timeouts
 from .orchestrator import RunResult, TargetOutcome
 from .redaction import Redactor
+from .state import Classification
 
 AGENTMAIL_BASE = "https://api.agentmail.to/v0"
 AGENTMAIL_INBOX = "nixbot@agentmail.to"
@@ -38,11 +45,25 @@ _RESOLVED_PREFIX = "WD-RESOLVED:"
 # Small filtered page: with a subject filter on the opaque key, the newest returned
 # message is the newest marker, regardless of unrelated inbox volume.
 _LOOKUP_LIMIT = 10
+# Pseudo-alias for the host-down roll-up; cannot collide (real aliases match ^svc-).
+HOST_ALIAS = "__host__"
+HOST_NAME = "self-hosted host"
+HOST_DOWN_DETAIL = (
+    "every target is unreachable: the whole host (the Mac mini, or its power/internet) "
+    "appears to be down"
+)
 
 
 def incident_key(alias: str) -> str:
     """Stable, opaque key for a target's incident (no real identifiers)."""
     return hashlib.sha256(alias.encode("utf-8")).hexdigest()[:16]
+
+
+def condition_fingerprint(condition: str | None) -> str:
+    """Opaque marker suffix for a condition; "" for none (legacy Railway-mode markers)."""
+    if not condition:
+        return ""
+    return hashlib.sha256(condition.encode("utf-8")).hexdigest()[:12]
 
 
 # --- email rendering ----------------------------------------------------------
@@ -56,9 +77,10 @@ def build_email(outcome: TargetOutcome, kind: str, redactor: Redactor) -> tuple[
     classification = outcome.classification.value if outcome.classification else "unknown"
     action = outcome.action
     elapsed = f"{outcome.elapsed_seconds:.2f}s"
-    verdict = "recovered" if kind == "recovery" else "unrecovered"
-    headline = "Recovery succeeded" if kind == "recovery" else "Recovery failed"
-    accent = "#3fb950" if kind == "recovery" else "#f85149"
+    verdict, headline, accent = {
+        "recovery": ("recovered", "Recovery succeeded", "#3fb950"),
+        "resolved": ("resolved", "Resolved", "#3fb950"),
+    }.get(kind, ("unrecovered", "Recovery failed", "#f85149"))
 
     subject = f"[watchdog] {headline} — {service} ({classification})"
 
@@ -71,6 +93,8 @@ def build_email(outcome: TargetOutcome, kind: str, redactor: Redactor) -> tuple[
     }
     if outcome.failure_reason is not None:
         rows["Reason"] = outcome.failure_reason.value
+    if outcome.detail:
+        rows["Detail"] = redactor.redact(outcome.detail)
     # HTML-escape every rendered value so no value can inject markup.
     row_html = "".join(
         f'<tr><td style="padding:6px 14px;color:#8b949e">{html_escape(k)}</td>'
@@ -101,6 +125,8 @@ def build_email(outcome: TargetOutcome, kind: str, redactor: Redactor) -> tuple[
     )
     if outcome.failure_reason is not None:
         text += f"Reason: {outcome.failure_reason.value}\n"
+    if outcome.detail:
+        text += f"Detail: {rows['Detail']}\n"
     # Defence in depth: redact the fully-rendered strings too.
     return redactor.redact(subject), redactor.redact(html), redactor.redact(text)
 
@@ -188,19 +214,26 @@ class AgentMailIncidentStore:
     def _marker_body(self, subject: str) -> None:
         self._client.send_message(AGENTMAIL_INBOX, subject, subject, subject)
 
-    def is_active(self, key: str) -> bool:
+    def active_condition(self, key: str) -> str | None:
+        """None if no active incident; else its condition fingerprint ("" = legacy)."""
         # Query by the opaque key; the newest exact marker for that key decides.
         messages = self._client.list_messages(subject_contains=key, limit=_LOOKUP_LIMIT)
+        incident = _INCIDENT_PREFIX + key
         for message in messages:  # newest-first
-            subject = message.get("subject", "")
-            if subject == _INCIDENT_PREFIX + key:
-                return True
+            subject = str(message.get("subject", ""))
+            if subject == incident:
+                return ""
+            if subject.startswith(incident + ":"):
+                return subject[len(incident) + 1:]
             if subject == _RESOLVED_PREFIX + key:
-                return False
-        return False
+                return None
+        return None
 
-    def mark_active(self, key: str) -> None:
-        self._marker_body(_INCIDENT_PREFIX + key)
+    def is_active(self, key: str) -> bool:
+        return self.active_condition(key) is not None
+
+    def mark_active(self, key: str, fingerprint: str = "") -> None:
+        self._marker_body(_INCIDENT_PREFIX + key + (f":{fingerprint}" if fingerprint else ""))
 
     def clear(self, key: str) -> None:
         if self.is_active(key):
@@ -227,11 +260,13 @@ class Notifier:
         recipient: str | None,
         store: AgentMailIncidentStore | None,
         redactor: Redactor,
+        selfhosted: bool = False,
     ) -> None:
         self._client = client
         self._recipient = recipient
         self._store = store
         self._redactor = redactor
+        self._selfhosted = selfhosted
 
     @staticmethod
     def _is_recovery(o: TargetOutcome) -> bool:
@@ -253,6 +288,9 @@ class Notifier:
             report.degraded = bool(notable)
             return report
 
+        if self._selfhosted and self._process_host(result, report):
+            return report
+
         for o in result.outcomes:
             if self._is_recovery(o):
                 self._send(o, "recovery")
@@ -261,20 +299,48 @@ class Notifier:
                     self._store.clear(incident_key(o.alias))
             elif self._is_failure(o):
                 key = incident_key(o.alias)
-                if self._store is not None and self._store.is_active(key):
-                    report.suppressed.append(o.alias)
+                fingerprint = condition_fingerprint(o.condition)
+                if self._store is not None and self._store.active_condition(key) == fingerprint:
+                    report.suppressed.append(o.alias)  # same condition already alerted
                     continue
                 self._send(o, "incident")
                 report.incidents.append(o.alias)
                 if self._store is not None:
-                    self._store.mark_active(key)
+                    self._store.mark_active(key, fingerprint)
             elif self._is_passive_healthy(o) and self._store is not None:
                 # Silently clear a lingering incident marker so a later outage alerts.
                 key = incident_key(o.alias)
                 if self._store.is_active(key):
+                    if self._selfhosted:  # self-hosted: say once that it recovered
+                        self._send(o, "resolved")
                     self._store.clear(key)
                     report.cleared.append(o.alias)
         return report
+
+    def _process_host(self, result: RunResult, report: NotifyReport) -> bool:
+        """Host-down roll-up. Returns True when per-target alerts must be skipped."""
+        key = incident_key(HOST_ALIAS)
+        host = TargetOutcome(
+            alias=HOST_ALIAS, service_name=HOST_NAME,
+            classification=Classification.HOST_UNREACHABLE, action="none",
+            recovered=False, deferred=False, elapsed_seconds=0.0, error=None,
+            detail=HOST_DOWN_DETAIL,
+        )
+        if result.host_down:
+            if self._store is not None and self._store.is_active(key):
+                report.suppressed.append(HOST_ALIAS)
+            else:
+                self._send(host, "incident")
+                report.incidents.append(HOST_ALIAS)
+                if self._store is not None:
+                    self._store.mark_active(key)
+            return True
+        if self._store is not None and self._store.is_active(key):
+            back = replace(host, detail="host is reachable again")
+            self._send(back, "resolved")
+            self._store.clear(key)
+            report.cleared.append(HOST_ALIAS)
+        return False
 
     def _send(self, outcome: TargetOutcome, kind: str) -> None:
         client, recipient = self._client, self._recipient
@@ -293,12 +359,15 @@ def build_notifier_from_env(
     *,
     transport: httpx.BaseTransport | None = None,
     clock: Callable[[], float] = time.time,
+    selfhosted: bool = False,
 ) -> Notifier:
     """Construct a Notifier from environment credentials, degrading if absent."""
     api_key = os.environ.get("AGENTMAIL_API_KEY")
     recipient = os.environ.get("WATCHDOG_ALERT_TO")
     if not api_key or not recipient:
-        return Notifier(client=None, recipient=None, store=None, redactor=redactor)
+        return Notifier(client=None, recipient=None, store=None, redactor=redactor,
+                        selfhosted=selfhosted)
     client = AgentMailClient(api_key, transport=transport)
     store = AgentMailIncidentStore(client)
-    return Notifier(client=client, recipient=recipient, store=store, redactor=redactor)
+    return Notifier(client=client, recipient=recipient, store=store, redactor=redactor,
+                    selfhosted=selfhosted)

@@ -4,6 +4,10 @@ The *only* source of target configuration is the `WATCHDOG_TARGETS_JSON` environ
 variable — never a checked-in file. It must decode to an object with three non-empty
 opaque ids and exactly seven fully-specified targets, none of which may equal the
 excluded service. Every validation failure raises a typed, public-safe error.
+
+With ``"mode": "selfhosted"`` there is no Railway: the Railway ids (top-level and
+per-target ``service_id``) are not required and are ignored; targets may add an https
+``webui_url`` and an ``ignore_platforms`` list.
 """
 
 from __future__ import annotations
@@ -24,6 +28,8 @@ from .errors import (
 
 ENV_VAR = "WATCHDOG_TARGETS_JSON"
 EXPECTED_TARGET_COUNT = 7
+MODE_RAILWAY = "railway"
+MODE_SELFHOSTED = "selfhosted"
 
 # Aliases must be strictly opaque (never a real service name) and safe to render:
 # lowercase ``svc-`` followed by 1-12 alphanumerics. This blocks markup, uppercase,
@@ -56,6 +62,10 @@ class Target:
     health_url: str = field(repr=False)
     admin_username: str = field(repr=False)
     admin_password: str = field(repr=False)
+    # Self-hosted mode only: optional web UI URL (secret) and platforms whose
+    # non-connected state is expected (platform names are public).
+    webui_url: str | None = field(default=None, repr=False)
+    ignore_platforms: frozenset[str] = frozenset()
 
     def secret_values(self) -> tuple[str, ...]:
         """Values the redactor must mask for this target.
@@ -68,6 +78,8 @@ class Target:
             self.admin_username,
             self.admin_password,
             _host_of(self.health_url),
+            self.webui_url or "",
+            _host_of(self.webui_url or ""),
         )
 
 
@@ -77,11 +89,16 @@ class WatchdogConfig:
     environment_id: str
     excluded_service_id: str
     targets: tuple[Target, ...]
+    mode: str = MODE_RAILWAY
+
+    @property
+    def selfhosted(self) -> bool:
+        return self.mode == MODE_SELFHOSTED
 
     def select_target(self, alias: str) -> Target:
         for target in self.targets:
             if target.alias == alias:
-                if target.service_id == self.excluded_service_id:
+                if self.excluded_service_id and target.service_id == self.excluded_service_id:
                     raise ExcludedServiceError(f"alias {alias!r} maps to the excluded service")
                 return target
         raise UnknownServiceError(f"unknown service alias {alias!r}")
@@ -106,25 +123,46 @@ def _require_nonblank_str(value: Any, label: str, exc: type[ConfigError]) -> str
     return value
 
 
-def _validate_https_url(url: str) -> None:
+def _validate_https_url(url: str, label: str = "health_url") -> None:
     try:
         parsed = urlparse(url)
     except ValueError as err:  # pragma: no cover - urlparse rarely raises
-        raise TargetValidationError("health_url is malformed") from err
+        raise TargetValidationError(f"{label} is malformed") from err
     if parsed.scheme != "https" or not parsed.hostname:
-        raise TargetValidationError("health_url must be a valid https URL with a host")
+        raise TargetValidationError(f"{label} must be a valid https URL with a host")
 
 
-def _build_target(raw: Any) -> Target:
+def _build_target(raw: Any, *, selfhosted: bool = False) -> Target:
     if not isinstance(raw, dict):
         raise TargetValidationError("each target must be an object")
     values: dict[str, str] = {}
     for name in _TARGET_FIELDS:
+        if selfhosted and name == "service_id":
+            values[name] = ""  # no Railway in self-hosted mode; ignore if present
+            continue
         values[name] = _require_nonblank_str(raw.get(name), f"target.{name}", TargetValidationError)
     if not ALIAS_PATTERN.match(values["alias"]):
         raise TargetValidationError("target alias must match the opaque svc- pattern")
     _validate_https_url(values["health_url"])
-    return Target(**values)
+    webui_url = raw.get("webui_url") if selfhosted else None  # Railway mode ignores both
+    ignore = raw.get("ignore_platforms", []) if selfhosted else []
+    if webui_url is not None:
+        webui_url = _require_nonblank_str(webui_url, "target.webui_url", TargetValidationError)
+        _validate_https_url(webui_url, "webui_url")
+    if not isinstance(ignore, list) or not all(
+        isinstance(p, str) and p.strip() for p in ignore
+    ):
+        raise TargetValidationError("target.ignore_platforms must be a list of names")
+    return Target(
+        alias=values["alias"],
+        service_name=values["service_name"],
+        service_id=values["service_id"],
+        health_url=values["health_url"],
+        admin_username=values["admin_username"],
+        admin_password=values["admin_password"],
+        webui_url=webui_url,
+        ignore_platforms=frozenset(p.strip().lower() for p in ignore),
+    )
 
 
 def load_config() -> WatchdogConfig:
@@ -138,6 +176,12 @@ def load_config() -> WatchdogConfig:
     if not isinstance(data, dict):
         raise ConfigError(f"{ENV_VAR} must be a JSON object")
 
+    mode = data.get("mode", MODE_RAILWAY)
+    if mode not in (MODE_RAILWAY, MODE_SELFHOSTED):
+        raise ConfigError("mode must be 'railway' or 'selfhosted'")
+    if mode == MODE_SELFHOSTED:
+        return _load_selfhosted(data)
+
     project_id = _require_nonblank_str(data.get("project_id"), "project_id", ConfigError)
     environment_id = _require_nonblank_str(
         data.get("environment_id"), "environment_id", ConfigError
@@ -146,19 +190,7 @@ def load_config() -> WatchdogConfig:
         data.get("excluded_service_id"), "excluded_service_id", ConfigError
     )
 
-    raw_targets = data.get("targets")
-    if not isinstance(raw_targets, list):
-        raise ConfigError("targets must be a list")
-    if len(raw_targets) != EXPECTED_TARGET_COUNT:
-        raise TargetValidationError(
-            f"expected exactly {EXPECTED_TARGET_COUNT} targets, got {len(raw_targets)}"
-        )
-
-    targets = tuple(_build_target(item) for item in raw_targets)
-
-    aliases = [t.alias for t in targets]
-    if len(set(aliases)) != len(aliases):
-        raise TargetValidationError("duplicate target alias")
+    targets = _build_targets(data)
     service_ids = [t.service_id for t in targets]
     if len(set(service_ids)) != len(service_ids):
         raise TargetValidationError("duplicate target service_id")
@@ -170,4 +202,30 @@ def load_config() -> WatchdogConfig:
         environment_id=environment_id,
         excluded_service_id=excluded_service_id,
         targets=targets,
+    )
+
+
+def _build_targets(data: dict[str, Any], *, selfhosted: bool = False) -> tuple[Target, ...]:
+    raw_targets = data.get("targets")
+    if not isinstance(raw_targets, list):
+        raise ConfigError("targets must be a list")
+    if len(raw_targets) != EXPECTED_TARGET_COUNT:
+        raise TargetValidationError(
+            f"expected exactly {EXPECTED_TARGET_COUNT} targets, got {len(raw_targets)}"
+        )
+    targets = tuple(_build_target(item, selfhosted=selfhosted) for item in raw_targets)
+    aliases = [t.alias for t in targets]
+    if len(set(aliases)) != len(aliases):
+        raise TargetValidationError("duplicate target alias")
+    return targets
+
+
+def _load_selfhosted(data: dict[str, Any]) -> WatchdogConfig:
+    """Self-hosted (no Railway) mode: Railway ids are not required and are ignored."""
+    return WatchdogConfig(
+        project_id="",
+        environment_id="",
+        excluded_service_id="",
+        targets=_build_targets(data, selfhosted=True),
+        mode=MODE_SELFHOSTED,
     )

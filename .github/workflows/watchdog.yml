@@ -46,7 +46,10 @@ jobs:
           pip install -e .
 
       - name: Run watchdog
-        # Production secrets are scoped to THIS step only.
+        # Production secrets are scoped to THIS step only. RAILWAY_API_TOKEN is only
+        # read in Railway mode; with "mode": "selfhosted" in WATCHDOG_TARGETS_JSON it
+        # may be unset/empty. Alert dedupe state lives in the private AgentMail inbox
+        # (opaque markers), so this job needs no cache or artifact between runs.
         env:
           RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
           WATCHDOG_TARGETS_JSON: ${{ secrets.WATCHDOG_TARGETS_JSON }}
