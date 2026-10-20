@@ -37,9 +37,21 @@ _SESSION_COOKIE_PREFIX = "hermes_session"
 
 
 @dataclass(frozen=True)
+class PlatformState:
+    """One messaging platform from ``gateway_platforms``. ``error_message`` may hold
+    secret-shaped text and must pass through the redactor before display."""
+
+    name: str
+    state: str
+    error_code: str | None = None
+    error_message: str | None = None
+
+
+@dataclass(frozen=True)
 class HealthResult:
     status_ok: bool
     gateway_running: bool
+    platforms: tuple[PlatformState, ...] = ()
 
     @property
     def healthy(self) -> bool:
@@ -49,6 +61,57 @@ class HealthResult:
 def _origin(url: str) -> tuple[str, str, int | None]:
     parts = urlsplit(url)
     return (parts.scheme, parts.hostname or "", parts.port)
+
+
+def _opt_str(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _parse_platforms(raw: Any) -> tuple[PlatformState, ...]:
+    if not isinstance(raw, dict):
+        return ()
+    platforms = []
+    for name, info in sorted(raw.items()):
+        if not isinstance(name, str):
+            continue
+        info = info if isinstance(info, dict) else {}
+        state = info.get("state")
+        platforms.append(
+            PlatformState(
+                name=name,
+                state=state if isinstance(state, str) and state else "unknown",
+                error_code=_opt_str(info.get("error_code")),
+                error_message=_opt_str(info.get("error_message")),
+            )
+        )
+    return tuple(platforms)
+
+
+def check_webui(
+    url: str,
+    deadline: Deadline | None = None,
+    *,
+    transport: httpx.BaseTransport | None = None,
+    timeouts: Timeouts | None = None,
+) -> int:
+    """GET the web UI without following redirects; return the HTTP status code.
+
+    Raises :class:`HermesHTTPError`/:class:`HermesTimeoutError` (generic text only) on
+    transport failure or an exhausted budget.
+    """
+    timeout = (timeouts or Timeouts()).as_httpx()
+    if deadline is not None:
+        remaining = deadline.remaining()
+        if remaining <= 0:
+            raise HermesTimeoutError("webui budget exhausted")
+        timeout = httpx.Timeout(min(remaining, 10.0))
+    try:
+        with httpx.Client(transport=transport, timeout=timeout, follow_redirects=False) as c:
+            return c.get(url).status_code
+    except httpx.TimeoutException:
+        raise HermesTimeoutError("webui request timed out") from None
+    except httpx.HTTPError:
+        raise HermesHTTPError("webui request failed") from None
 
 
 class HermesClient:
@@ -152,7 +215,11 @@ class HermesClient:
             raise HermesProtocolError("hermes health returned invalid JSON") from None
         if not isinstance(body, dict):
             raise HermesProtocolError("hermes health returned a non-object body")
-        return HealthResult(status_ok=True, gateway_running=body.get("gateway_running") is True)
+        return HealthResult(
+            status_ok=True,
+            gateway_running=body.get("gateway_running") is True,
+            platforms=_parse_platforms(body.get("gateway_platforms")),
+        )
 
     # -- health ---------------------------------------------------------------
 

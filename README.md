@@ -54,6 +54,51 @@ target creds ─▶ hermes ────────────▶└───�
   failure only; durable dedup via opaque markers in a private inbox.
 - **`redaction`** — central redactor every output passes through.
 
+## Self-hosted mode (no Railway)
+
+Set `"mode": "selfhosted"` in `WATCHDOG_TARGETS_JSON` when the agents run on your own
+host (e.g. Docker on a Mac mini) and are reachable only through their public dashboard /
+web UI hostnames. No Railway call is made and `RAILWAY_API_TOKEN` is not needed.
+Railway ids are not required (ignored if present); the seven-target rule still holds.
+
+```json
+{
+  "mode": "selfhosted",
+  "targets": [
+    {
+      "alias": "svc-a",
+      "service_name": "agent-a",
+      "health_url": "https://agent-a-dashboard.example.test/api/status",
+      "webui_url": "https://agent-a.example.test",
+      "ignore_platforms": ["whatsapp"],
+      "admin_username": "admin",
+      "admin_password": "fake-password"
+    }
+  ]
+}
+```
+
+(`webui_url` and `ignore_platforms` are optional; list all seven targets.)
+
+| Classification | Meaning | Action |
+|---|---|---|
+| `healthy` | dashboard up, gateway running, every non-ignored platform `connected`, web UI 200/302 | none |
+| `host_unreachable` | dashboard unreachable / non-200 / login rejected | none, alert |
+| `gateway_only_failure` | `gateway_running: false` | one gateway restart + verify |
+| `platform_degraded` | a non-ignored platform is not `connected` (summary names it; error text redacted) | none, alert |
+| `webui_down` | web UI not 200/302 or unreachable (redirects not followed) | none, alert |
+
+If every target is `host_unreachable`, the summary and a single alert say the whole host
+appears down instead of listing seven failures.
+
+**Alert dedupe.** State persists between the 5-minute runs in the private AgentMail inbox
+as opaque `WD-INCIDENT:<hash>[:<condition-hash>]` / `WD-RESOLVED:<hash>` marker messages
+(the same store Railway mode already used). An alert is sent when a target's condition
+first appears or changes (different classification, or a different set of degraded
+platforms), and one "Resolved" email when it recovers. Error text and HTTP codes are not
+part of the condition, so flapping messages do not re-alert. No Actions cache or artifact
+is used.
+
 ## Threat model
 
 > **Intentionally public by operator choice:** the `service_name` of each target. It is
@@ -83,7 +128,7 @@ target creds ─▶ hermes ────────────▶└───�
 | Key | Purpose |
 |-----|---------|
 | `WATCHDOG_TARGETS_JSON` | The seven targets + project/environment/excluded ids. |
-| `RAILWAY_API_TOKEN` | Railway GraphQL API auth. |
+| `RAILWAY_API_TOKEN` | Railway GraphQL API auth (Railway mode only; not needed in self-hosted mode). |
 | `AGENTMAIL_API_KEY` | AgentMail notification auth (optional; absence degrades gracefully). |
 | `WATCHDOG_ALERT_TO` | Alert recipient address (optional; absence degrades gracefully). |
 

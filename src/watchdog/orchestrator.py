@@ -20,12 +20,21 @@ from datetime import datetime, timedelta
 from typing import Protocol
 
 from .config import Target, WatchdogConfig
-from .errors import FailureReason, HermesError, failure_reason
-from .hermes import HealthResult
+from .errors import FailureReason, HermesAuthError, HermesError, WatchdogError, failure_reason
+from .hermes import HealthResult, check_webui
 from .http import Budget, Deadline
 from .railway import DeploymentStatus, ServiceStatus
 from .redaction import Redactor
-from .state import Classification, HealthProbe, classify
+from .state import (
+    Classification,
+    HealthProbe,
+    Verdict,
+    classify,
+    classify_selfhosted,
+    classify_webui,
+)
+
+WebuiCheck = Callable[[str, Deadline | None], int]
 
 
 class RailwayLike(Protocol):
@@ -58,6 +67,8 @@ class TargetOutcome:
     elapsed_seconds: float
     error: str | None
     failure_reason: FailureReason | None = None
+    detail: str | None = None  # redacted, public-safe extra context (self-hosted mode)
+    condition: str | None = None  # stable dedupe signature (self-hosted mode)
 
 
 @dataclass(frozen=True)
@@ -70,6 +81,13 @@ class RunResult:
 
     def unrecovered(self) -> list[TargetOutcome]:
         return [o for o in self.outcomes if not o.recovered and not o.deferred]
+
+    @property
+    def host_down(self) -> bool:
+        """Every target (more than one) unreachable: the whole host is likely down."""
+        return len(self.outcomes) > 1 and all(
+            o.classification is Classification.HOST_UNREACHABLE for o in self.outcomes
+        )
 
 
 @dataclass(frozen=True)
@@ -84,7 +102,7 @@ class Orchestrator:
         self,
         *,
         config: WatchdogConfig,
-        railway: RailwayLike,
+        railway: RailwayLike | None,
         hermes_factory: Callable[[Target], HermesLike],
         redactor: Redactor,
         now: Callable[[], datetime],
@@ -97,6 +115,7 @@ class Orchestrator:
         wait_attempts: int = 20,
         wait_interval: float = 3.0,
         concurrency: int = 3,
+        webui_check: WebuiCheck = check_webui,
     ) -> None:
         self._config = config
         self._railway = railway
@@ -112,6 +131,13 @@ class Orchestrator:
         self._wait_attempts = wait_attempts
         self._wait_interval = wait_interval
         self._concurrency = concurrency
+        self._webui_check = webui_check
+
+    @property
+    def _rw(self) -> RailwayLike:
+        if self._railway is None:
+            raise WatchdogError("railway client is unavailable in selfhosted mode")
+        return self._railway
 
     # -- public ---------------------------------------------------------------
 
@@ -133,6 +159,8 @@ class Orchestrator:
         hermes: HermesLike | None = None
         try:
             hermes = self._hermes_factory(target)
+            if self._config.selfhosted:
+                return self._selfhosted_one(target, hermes, budget, start)
             _, _, cls = self._probe(target, hermes, budget)
             if self._dry_run:
                 return self._done(target, cls, "none",
@@ -178,6 +206,7 @@ class Orchestrator:
         start: float,
         error: str | None = None,
         reason: FailureReason | None = None,
+        verdict: Verdict | None = None,
     ) -> TargetOutcome:
         return TargetOutcome(
             alias=target.alias,
@@ -189,7 +218,73 @@ class Orchestrator:
             elapsed_seconds=round(self._monotonic() - start, 3),
             error=error,
             failure_reason=reason,
+            detail=self._redactor.redact(verdict.detail) if verdict and verdict.detail else None,
+            condition=verdict.condition if verdict else None,
         )
+
+    # -- self-hosted mode (no Railway) ----------------------------------------
+
+    def _selfhosted_one(
+        self, target: Target, hermes: HermesLike, budget: Budget | None, start: float
+    ) -> TargetOutcome:
+        v, reason = self._sh_probe(target, hermes, budget)
+        if self._dry_run or v.classification is not Classification.GATEWAY_ONLY_FAILURE:
+            return self._sh_done(target, v, "none", start, reason)
+        # Fresh-state recheck immediately before mutating.
+        v, reason = self._sh_probe(target, hermes, budget)
+        if v.classification is not Classification.GATEWAY_ONLY_FAILURE:
+            return self._sh_done(target, v, "none", start, reason)
+        if self._expired(budget):
+            return self._sh_done(target, v, "none", start, FailureReason.TIMEOUT)
+        try:  # at most once per run
+            ok = hermes.restart_gateway(
+                target.admin_username, target.admin_password, deadline=budget
+            )
+        except HermesError as err:
+            return self._sh_done(target, v, "gateway_restart", start, failure_reason(err))
+        if not ok or self._expired(budget):
+            return self._sh_done(target, v, "gateway_restart", start, None)
+        after, reason = self._sh_probe(target, hermes, budget)
+        # Report the post-restart verdict (e.g. a platform still degraded).
+        return self._sh_done(target, after, "gateway_restart", start, reason)
+
+    def _sh_done(
+        self, target: Target, v: Verdict, action: str, start: float,
+        reason: FailureReason | None,
+    ) -> TargetOutcome:
+        healthy = v.classification is Classification.HEALTHY
+        return self._done(target, v.classification, action, healthy, False, start,
+                          reason=None if healthy else reason, verdict=v)
+
+    def _sh_probe(
+        self, target: Target, hermes: HermesLike, budget: Budget | None
+    ) -> tuple[Verdict, FailureReason | None]:
+        health: HealthResult | None = None
+        reason: FailureReason | None = None
+        for attempt in range(self._health_retries + 1):
+            if self._expired(budget):
+                reason = reason or FailureReason.TIMEOUT
+                break
+            try:
+                health = hermes.check_health(deadline=budget)
+                break
+            except HermesError as err:
+                reason = failure_reason(err)
+                if isinstance(err, HermesAuthError):
+                    break  # never hammer a login that is being rejected
+                if attempt < self._health_retries:
+                    self._sleep_clipped(budget, self._wait_interval)
+        v = classify_selfhosted(
+            HealthProbe(reachable=health is not None, result=health),
+            ignore_platforms=target.ignore_platforms,
+        )
+        if v.classification is Classification.HEALTHY and target.webui_url:
+            try:
+                code: int | None = self._webui_check(target.webui_url, budget)
+            except HermesError:
+                code = None
+            v = classify_webui(code)
+        return v, reason if health is None else None
 
     # -- recovery strategies --------------------------------------------------
 
@@ -223,7 +318,7 @@ class Orchestrator:
         deployment_id = status.restartable_deployment_id
         if deployment_id is None or self._expired(budget):
             return _Recovery(False, "none", False)
-        ok = self._railway.restart_current_deployment(
+        ok = self._rw.restart_current_deployment(
             deployment_id, deadline=budget
         )
         if not ok:  # a false result is a mutation failure, never a silent success
@@ -267,7 +362,7 @@ class Orchestrator:
         for attempt in range(self._wait_attempts):
             if self._expired(budget):
                 return False
-            status = self._railway.get_service_status(
+            status = self._rw.get_service_status(
                 self._config.project_id, self._config.environment_id, target.service_id,
                 deadline=budget,
             )
@@ -288,7 +383,7 @@ class Orchestrator:
     def _probe(
         self, target: Target, hermes: HermesLike, budget: Budget | None
     ) -> tuple[ServiceStatus, HealthProbe, Classification]:
-        status = self._railway.get_service_status(
+        status = self._rw.get_service_status(
             self._config.project_id, self._config.environment_id, target.service_id,
             deadline=budget,
         )
